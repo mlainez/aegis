@@ -184,11 +184,23 @@ impl PolicyFile {
     }
 }
 
-/// Concatenate two list fields with dedup. Order preserved (base first,
-/// then user file's new entries).
+/// Merge an inherited list (`base`) with a user-file list (`over`),
+/// supporting gitignore-style negation:
+///
+/// - `"X"` adds `X` (with dedup against base).
+/// - `"!X"` removes `X` from the result if present. If `X` wasn't in
+///   the base, this is a silent no-op.
+///
+/// Negations are intentional weakening of an inherited deny — they're
+/// visible in the policy file (`!~/.aws/**` is hard to mistake for a
+/// typo) and survive every code review the policy goes through.
+/// Within a single user file, order matters: `["!X", "X"]` ends with
+/// `X` present; `["X", "!X"]` ends with `X` absent.
 fn concat_dedup(mut base: Vec<String>, over: Vec<String>) -> Vec<String> {
     for v in over {
-        if !base.contains(&v) {
+        if let Some(target) = v.strip_prefix('!') {
+            base.retain(|item| item != target);
+        } else if !base.contains(&v) {
             base.push(v);
         }
     }
@@ -202,7 +214,9 @@ fn merge_deny_args(
     for (k, v) in over {
         let entry = base.entry(k).or_default();
         for item in v {
-            if !entry.contains(&item) {
+            if let Some(target) = item.strip_prefix('!') {
+                entry.retain(|s| s != target);
+            } else if !entry.contains(&item) {
                 entry.push(item);
             }
         }
@@ -1094,6 +1108,154 @@ allow = ["fs.read"]
         // Preset's deny entries also survived.
         assert!(file.filesystem.deny.iter().any(|p| p == "~/.aws/**"));
         assert!(file.filesystem.deny.iter().any(|p| p == ".env"));
+    }
+
+    #[test]
+    fn override_can_remove_preset_filesystem_deny() {
+        let user = r#"
+inherits = "secure-defaults"
+
+[filesystem]
+read_allow = ["~/.aws/**"]      # we WANT to read aws creds
+deny = ["!~/.aws/**"]           # remove the inherited block
+
+[functions]
+allow = ["fs.read"]
+"#;
+        let file = PolicyFile::from_toml_str(user)
+            .unwrap()
+            .resolve_inheritance()
+            .unwrap();
+        // The preset's universal `~/.aws/**` deny is gone.
+        assert!(!file.filesystem.deny.iter().any(|p| p == "~/.aws/**"));
+        // Other inherited denies are still there.
+        assert!(file.filesystem.deny.iter().any(|p| p == "**/.env"));
+    }
+
+    #[test]
+    fn override_can_unblock_preset_subprocess_command() {
+        // Preset blocks kubectl. A k8s operator agent legitimately
+        // needs it inside a kind/minikube sandbox.
+        let user = r#"
+inherits = "secure-defaults"
+
+[subprocess]
+allow_commands = ["kubectl"]
+deny_commands = ["!kubectl"]    # un-deny
+
+[functions]
+allow = ["subprocess.exec"]
+"#;
+        let file = PolicyFile::from_toml_str(user)
+            .unwrap()
+            .resolve_inheritance()
+            .unwrap();
+        assert!(!file.subprocess.deny_commands.iter().any(|c| c == "kubectl"));
+        // Other inherited denies remain.
+        assert!(file.subprocess.deny_commands.iter().any(|c| c == "rm"));
+        assert!(file.subprocess.deny_commands.iter().any(|c| c == "sudo"));
+    }
+
+    #[test]
+    fn override_can_remove_preset_deny_ip_cidr() {
+        // Local dev: legitimately want to talk to a service on
+        // 127.0.0.1 (the preset's loopback block normally prevents this).
+        let user = r#"
+inherits = "secure-defaults"
+
+[network]
+http_get_allow = ["localhost"]
+deny_ips = ["!127.0.0.0/8"]
+
+[functions]
+allow = ["net.http_get"]
+"#;
+        let file = PolicyFile::from_toml_str(user)
+            .unwrap()
+            .resolve_inheritance()
+            .unwrap();
+        assert!(!file.network.deny_ips.iter().any(|p| p == "127.0.0.0/8"));
+        // Cloud metadata block survives.
+        assert!(file
+            .network
+            .deny_ips
+            .iter()
+            .any(|p| p == "169.254.0.0/16"));
+        // Final policy parses cleanly (no leftover "!..." strings).
+        let p = Policy::from_file(file, PathBuf::from("/work")).unwrap();
+        // Confirm the IP-level check now lets 127.0.0.1 through.
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        assert!(p.check_resolved_ip("http_get", "localhost", ip).is_ok());
+        // ...while 169.254.169.254 is still rejected.
+        let metadata: IpAddr = "169.254.169.254".parse().unwrap();
+        assert!(p
+            .check_resolved_ip("http_get", "metadata", metadata)
+            .is_err());
+    }
+
+    #[test]
+    fn override_negate_nonexistent_is_silent_noop() {
+        let user = r#"
+inherits = "secure-defaults"
+
+[filesystem]
+read_allow = ["src/**"]
+deny = ["!~/never-was-in-the-preset/**"]
+
+[functions]
+allow = ["fs.read"]
+"#;
+        // No error; merged file just doesn't have that entry.
+        let file = PolicyFile::from_toml_str(user)
+            .unwrap()
+            .resolve_inheritance()
+            .unwrap();
+        // The `!` form is consumed, not retained.
+        assert!(!file
+            .filesystem
+            .deny
+            .iter()
+            .any(|p| p.starts_with('!')));
+    }
+
+    #[test]
+    fn override_can_remove_preset_confirm() {
+        let user = r#"
+inherits = "secure-defaults"
+confirm_per_call = ["!subprocess.exec"]
+
+[functions]
+allow = ["subprocess.exec"]
+"#;
+        let file = PolicyFile::from_toml_str(user)
+            .unwrap()
+            .resolve_inheritance()
+            .unwrap();
+        // subprocess.exec is no longer prompt-gated.
+        assert!(!file
+            .confirm_per_call
+            .iter()
+            .any(|c| c == "subprocess.exec"));
+        // fs.delete is still prompt-gated.
+        assert!(file.confirm_per_call.iter().any(|c| c == "fs.delete"));
+    }
+
+    #[test]
+    fn override_can_remove_specific_deny_args_pattern() {
+        let preset_like = r#"
+[subprocess.deny_args]
+git = ["push --force", "reset --hard"]
+"#;
+        let user = r#"
+[subprocess.deny_args]
+git = ["!reset --hard"]
+"#;
+        let base = PolicyFile::from_toml_str(preset_like).unwrap();
+        let over = PolicyFile::from_toml_str(user).unwrap();
+        let merged = merge_policy_files(base, over);
+        let git_args = merged.subprocess.deny_args.get("git").unwrap();
+        assert!(git_args.contains(&"push --force".to_string()));
+        assert!(!git_args.contains(&"reset --hard".to_string()));
     }
 
     #[test]

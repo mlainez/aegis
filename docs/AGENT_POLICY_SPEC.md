@@ -196,16 +196,60 @@ known-good baseline.
 Merge semantics: the preset is loaded as the base, the user file's
 fields are merged on top.
 
-- **List fields** (allow lists, deny lists) **concatenate with dedup**.
-  The user can extend the preset; they cannot remove preset entries.
-  This is intentional — presets exist precisely so a user can't
-  accidentally weaken them.
+- **List fields** (allow lists, deny lists, `confirm_per_call`)
+  **concatenate with dedup**. A user-file entry of the form `"!X"`
+  *removes* `X` from the inherited list (gitignore-style negation);
+  this is the supported override path. Negation of an entry that
+  isn't in the inherited list is a silent no-op.
 - **Map fields** (`subprocess.deny_args`) merge by key; for shared
-  keys, the value lists concatenate.
+  keys, the value lists concatenate (with `!`-prefix negation per
+  pattern).
 - **Scalar fields** (`name`, `description`, `version`): user-file
   value wins if present, otherwise the preset's.
 - **`inherits`** does not chain. Presets are not allowed to declare
   their own `inherits`.
+
+#### Overriding preset entries
+
+Sometimes a project legitimately needs to weaken an inherited deny
+— a Kubernetes operator agent inside a kind/minikube sandbox where
+`kubectl` IS the operator surface, a local-dev policy where the
+agent is supposed to talk to `127.0.0.1`, an internal CI where
+`pip --user` is the right call. The `!`-prefix syntax handles
+these:
+
+```toml
+inherits = "secure-defaults"
+
+[subprocess]
+allow_commands = ["kubectl"]
+deny_commands = ["!kubectl"]    # un-deny kubectl; preset's other denies stand
+
+[network]
+http_get_allow = ["localhost"]
+deny_ips = ["!127.0.0.0/8"]     # un-block loopback
+
+[filesystem]
+deny = ["!~/.kube/config"]      # un-block ~/.kube/config so kubectl can read it
+```
+
+Two design choices behind this:
+
+1. **Visibility.** A `!`-prefixed entry is hard to mistake for a
+   typo in code review. "Why does this policy have `!kubectl`?" is
+   a question that gets asked, where a quietly-shorter inherited
+   list would not. Operators who want to weaken security have to
+   say so explicitly, in writing, in version control.
+2. **Granularity.** The user removes only the entries they need to.
+   Other inherited denies (`rm`, `sudo`, `**/.env`, AWS metadata IP)
+   stay enforced. The alternative — replace-the-whole-list — gives
+   too much footgun room: the operator forgets one entry and
+   everything inherited along with it goes silently absent.
+
+Within a single user file, order matters: `["!X", "X"]` ends with
+`X` present (the negation removes nothing, then `X` is added);
+`["X", "!X"]` ends with `X` absent. In practice, mixing both is a
+smell — pick one.
 
 A v1-conformant implementation MUST ship at least the
 `secure-defaults` preset, covering universally-bad actions on any
