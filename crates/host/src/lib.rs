@@ -15,7 +15,8 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
 
-use aegis_policy::{Policy, PolicyError};
+use aegis_policy::Policy;
+pub use aegis_policy::PolicyError;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::{GlobalsBuilder, LibraryExtension, Module};
 use starlark::eval::Evaluator;
@@ -46,7 +47,7 @@ pub enum AegisError {
     #[error("starlark error: {0}")]
     Starlark(String),
     #[error("policy violation: {0}")]
-    Policy(#[from] PolicyError),
+    Policy(String),
     #[error("verifier rejected script: {0}")]
     Verifier(String),
     #[error("confirm hook denied capability {0}")]
@@ -55,6 +56,26 @@ pub enum AegisError {
     Io(#[from] std::io::Error),
     #[error("{0}")]
     Other(String),
+}
+
+impl From<PolicyError> for AegisError {
+    fn from(e: PolicyError) -> Self {
+        AegisError::Policy(e.to_string())
+    }
+}
+
+/// Captured error stashed on HostCtx so Runner::run can recover the
+/// original error kind after Starlark wraps everything in its own type.
+#[derive(Clone, Debug)]
+struct CapturedError {
+    kind: CapturedKind,
+    message: String,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum CapturedKind {
+    Policy,
+    ConfirmDenied,
 }
 
 /// Outcome of running a script.
@@ -109,6 +130,7 @@ impl Runner {
             task_id: task_id.to_string(),
             step: RefCell::new(0),
             printed: RefCell::new(Vec::new()),
+            captured: RefCell::new(None),
         };
 
         let globals = GlobalsBuilder::extended_by(&[
@@ -123,15 +145,29 @@ impl Runner {
         .with(register_builtins)
         .build();
         let module = Module::new();
-        {
+        let eval_result = {
             let print_handler = PrintCapture { ctx: &ctx };
             let mut eval = Evaluator::new(&module);
             eval.set_print_handler(&print_handler);
             eval.extra = Some(&ctx);
             eval.eval_module(ast, &globals)
-                .map_err(|e| AegisError::Starlark(e.to_string()))?;
-        }
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        let captured = ctx.captured.borrow_mut().take();
         let printed = ctx.printed.into_inner();
+
+        if let Err(starlark_msg) = eval_result {
+            // If a builtin captured a typed error before Starlark wrapped
+            // it, surface that — the kind drives exit-code mapping.
+            return Err(match captured {
+                Some(c) => match c.kind {
+                    CapturedKind::Policy => AegisError::Policy(c.message),
+                    CapturedKind::ConfirmDenied => AegisError::ConfirmDenied(c.message),
+                },
+                None => AegisError::Starlark(starlark_msg),
+            });
+        }
 
         Ok(RunOutcome { printed })
     }
@@ -146,6 +182,7 @@ struct HostCtx {
     task_id: String,
     step: RefCell<u32>,
     printed: RefCell<Vec<String>>,
+    captured: RefCell<Option<CapturedError>>,
 }
 
 impl HostCtx {
@@ -162,16 +199,35 @@ impl HostCtx {
         let req = ConfirmRequest {
             task_id: self.task_id.clone(),
             capability: capability.to_string(),
-            summary,
+            summary: summary.clone(),
         };
         match self.confirm.confirm(&req) {
             ConfirmDecision::Allow => Ok(()),
-            ConfirmDecision::Deny => Err(AegisError::ConfirmDenied(capability.to_string())),
+            ConfirmDecision::Deny => {
+                let step = *self.step.borrow();
+                self.emit(AuditEvent::denied(
+                    &self.task_id,
+                    step,
+                    capability,
+                    &summary,
+                    "confirm hook denied",
+                ));
+                let msg = capability.to_string();
+                self.capture(CapturedKind::ConfirmDenied, &msg);
+                Err(AegisError::ConfirmDenied(msg))
+            }
         }
     }
 
     fn emit(&self, event: AuditEvent) {
         self.audit.emit(event);
+    }
+
+    fn capture(&self, kind: CapturedKind, message: &str) {
+        *self.captured.borrow_mut() = Some(CapturedError {
+            kind,
+            message: message.to_string(),
+        });
     }
 }
 
@@ -214,13 +270,15 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
                 Ok(result?)
             }
             Err(e) => {
+                let msg = e.to_string();
                 ctx.emit(AuditEvent::denied(
                     &ctx.task_id,
                     step,
                     "fs_read",
                     &format!("path={path}"),
-                    &e.to_string(),
+                    &msg,
                 ));
+                ctx.capture(CapturedKind::Policy, &msg);
                 Err(e.into())
             }
         }
@@ -256,13 +314,15 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
                 Ok(NoneType)
             }
             Err(e) => {
+                let msg = e.to_string();
                 ctx.emit(AuditEvent::denied(
                     &ctx.task_id,
                     step,
                     "fs_write",
                     &format!("path={path}"),
-                    &e.to_string(),
+                    &msg,
                 ));
+                ctx.capture(CapturedKind::Policy, &msg);
                 Err(e.into())
             }
         }
@@ -348,13 +408,15 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
                 result
             }
             Err(e) => {
+                let msg = e.to_string();
                 ctx.emit(AuditEvent::denied(
                     &ctx.task_id,
                     step,
                     "net_http_get",
                     &format!("url={url}"),
-                    &e.to_string(),
+                    &msg,
                 ));
+                ctx.capture(CapturedKind::Policy, &msg);
                 Err(e.into())
             }
         }
