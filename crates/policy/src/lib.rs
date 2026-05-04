@@ -43,6 +43,18 @@ pub enum PolicyError {
 /// tampering).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PolicyFile {
+    /// Optional schema version. Consumers that pin to a major version
+    /// should reject files whose `version` mismatches. Absent = "I'll
+    /// take whatever you parse".
+    #[serde(default)]
+    pub version: Option<String>,
+
+    /// Free-form metadata for humans / CI. Not interpreted.
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+
     #[serde(default)]
     pub filesystem: FilesystemPolicy,
     #[serde(default)]
@@ -51,6 +63,16 @@ pub struct PolicyFile {
     pub environment: EnvironmentPolicy,
     #[serde(default)]
     pub subprocess: SubprocessPolicy,
+    /// Schema for declaring database access. The Aegis runtime does not
+    /// enforce this section directly (no db.* builtins yet); it's part
+    /// of the portable policy schema so other agentic systems and
+    /// future Aegis versions can read it.
+    #[serde(default)]
+    pub database: DatabasePolicy,
+    /// Schema for declaring deployment / infrastructure access. Same
+    /// portability story as `database`.
+    #[serde(default)]
+    pub deployment: DeploymentPolicy,
     #[serde(default)]
     pub functions: FunctionPolicy,
     #[serde(default)]
@@ -77,6 +99,14 @@ pub struct NetworkPolicy {
     pub http_get_allow: Vec<String>,
     #[serde(default)]
     pub http_post_allow: Vec<String>,
+    /// Reserved for future enforcement; included in the schema so
+    /// portable policy files can declare PUT/PATCH/DELETE intent today.
+    #[serde(default)]
+    pub http_put_allow: Vec<String>,
+    #[serde(default)]
+    pub http_patch_allow: Vec<String>,
+    #[serde(default)]
+    pub http_delete_allow: Vec<String>,
     #[serde(default)]
     pub deny_hosts: Vec<String>,
     #[serde(default)]
@@ -112,6 +142,83 @@ pub struct SubprocessPolicy {
     /// Commands that are never permitted; deny wins over allow.
     #[serde(default)]
     pub deny_commands: Vec<String>,
+    /// Per-command argument denylist. Map keys are commands (basename
+    /// match), values are forbidden argument patterns (substring match
+    /// against the joined argv). Examples: `"git" = ["push --force",
+    /// "reset --hard"]`. Reserved for future enforcement; declared in
+    /// the spec so portable policies can capture intent today.
+    #[serde(default)]
+    pub deny_args: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DatabasePolicy {
+    /// Allowed connections. Connection name is opaque to the policy
+    /// engine — the host integration maps a name to a real DSN.
+    #[serde(default)]
+    pub connections: Vec<DatabaseConnection>,
+    /// Connections the agent must never reference (production primary,
+    /// admin handles, etc.). Deny wins over `connections`.
+    #[serde(default)]
+    pub deny_connections: Vec<String>,
+    /// SQL operations the agent must never run on any connection,
+    /// regardless of read/write flags. Operations are matched
+    /// case-insensitively against the leading keyword of a query.
+    /// Examples: `"DROP"`, `"TRUNCATE"`, `"ALTER"`, `"CREATE USER"`.
+    #[serde(default)]
+    pub deny_operations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DatabaseConnection {
+    pub name: String,
+    #[serde(default)]
+    pub read: bool,
+    #[serde(default)]
+    pub write: bool,
+    /// Schemas the agent may touch on this connection. Empty = no
+    /// restriction (subject to deny_tables).
+    #[serde(default)]
+    pub schemas_allow: Vec<String>,
+    /// Tables the agent must not touch even on a writable connection.
+    /// Globs are permitted ("auth.*", "billing.*").
+    #[serde(default)]
+    pub tables_deny: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DeploymentPolicy {
+    /// Per-target action allowlist. Targets are symbolic names
+    /// (`"dev"`, `"staging"`, `"prod_eu"`); the host integration maps
+    /// those onto kubectl contexts, AWS profiles, terraform workspaces,
+    /// etc.
+    #[serde(default)]
+    pub targets: Vec<DeploymentTarget>,
+    /// Targets the agent must never address.
+    #[serde(default)]
+    pub deny_targets: Vec<String>,
+    /// Tools the policy speaks to (kubectl, terraform, aws, gcloud,
+    /// flyctl). Acts as a hint to host integrations — the actual
+    /// enforcement of which tool is invoked usually flows through
+    /// [subprocess].allow_commands.
+    #[serde(default)]
+    pub tools: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DeploymentTarget {
+    pub name: String,
+    /// Action verbs allowed on this target. Conventional verbs:
+    /// "get", "describe", "logs", "status", "apply", "rollout",
+    /// "scale", "delete", "exec". Globs permitted ("*").
+    #[serde(default)]
+    pub allow_actions: Vec<String>,
+    /// Verbs forbidden on this target; deny wins over allow.
+    #[serde(default)]
+    pub deny_actions: Vec<String>,
+    /// Free-form note for humans (why this target has these rules).
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 impl PolicyFile {
@@ -627,5 +734,46 @@ allow = ["env.read", "subprocess.exec"]
         let p = full_policy();
         assert!(p.check_subprocess_command("curl").is_err());
         assert!(p.check_subprocess_command("ssh").is_err());
+    }
+
+    #[test]
+    fn database_and_deployment_sections_deserialize() {
+        let toml = r#"
+version = "1"
+name = "fastapi_prod_readonly"
+
+[database]
+deny_connections = ["prod_primary"]
+deny_operations = ["DROP", "TRUNCATE", "ALTER"]
+
+[[database.connections]]
+name = "prod_replica"
+read = true
+write = false
+schemas_allow = ["public", "analytics"]
+tables_deny = ["users", "auth.*", "billing.*"]
+
+[deployment]
+deny_targets = ["prod_us_primary"]
+tools = ["kubectl", "aws"]
+
+[[deployment.targets]]
+name = "prod_eu"
+allow_actions = ["get", "describe", "logs"]
+deny_actions = ["delete", "scale", "apply"]
+note = "Read-only diagnostic access only"
+"#;
+        let file = PolicyFile::from_toml_str(toml).unwrap();
+        assert_eq!(file.version.as_deref(), Some("1"));
+        assert_eq!(file.database.connections.len(), 1);
+        assert_eq!(file.database.connections[0].name, "prod_replica");
+        assert!(file.database.connections[0].read);
+        assert!(!file.database.connections[0].write);
+        assert_eq!(file.deployment.targets.len(), 1);
+        assert_eq!(file.deployment.targets[0].name, "prod_eu");
+        assert_eq!(
+            file.deployment.targets[0].allow_actions,
+            vec!["get".to_string(), "describe".to_string(), "logs".to_string()]
+        );
     }
 }
