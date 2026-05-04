@@ -1,0 +1,52 @@
+# Multi-step test fixture policy.
+#
+# More permissive than dev.toml — adds the read-only Unix utilities a
+# realistic developer agent reaches for (cat, head, tail, wc, grep,
+# find, sort, uniq, date, uname, du, df, diff). Inherits secure-defaults
+# so all the universal denies (~/.aws, ~/.ssh, **/.env, AWS_*,
+# OPENAI_API_KEY, cloud metadata, RFC1918, etc.) still apply.
+#
+# This policy is the harness fixture for examples/local_executor/run_multistep.py.
+
+inherits = "secure-defaults"
+name = "multistep_test"
+description = "Permissive policy for the multistep evaluation harness."
+
+[filesystem]
+read_allow = [
+    "/tmp/aegis_demo/**",
+    "/etc/hostname",
+    "/etc/os-release",
+    "examples/**",
+]
+write_allow = ["/tmp/aegis_demo/**"]
+delete_allow = ["/tmp/aegis_demo/**"]
+
+[network]
+http_get_allow = [
+    "api.github.com",
+    "raw.githubusercontent.com",
+]
+
+[environment]
+allow_vars = ["USER", "HOME", "PATH", "LANG", "PWD", "SHELL", "TERM"]
+
+[subprocess]
+allow_commands = [
+    "git", "echo",
+    "cat", "ls", "head", "tail", "wc",
+    "grep", "find", "sort", "uniq",
+    "date", "hostname", "uname",
+    "du", "df", "diff",
+]
+
+[subprocess.deny_args]
+git = ["push --force", "push -f", "reset --hard", "clean -fd"]
+
+[functions]
+allow = [
+    "fs.read", "fs.write", "fs.delete",
+    "net.http_get",
+    "subprocess.exec",
+    "env.read",
+]
