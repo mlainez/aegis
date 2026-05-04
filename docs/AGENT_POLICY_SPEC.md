@@ -150,6 +150,20 @@ allow_commands = ["git", "npm", "pytest", "ruff", "black"]
 git = ["push --force", "reset --hard", "clean -fd"]
 npm = ["publish"]
 
+# ----- Host tools (optional) -----
+[tools]
+# Map external tool names (as exposed by an MCP host or an IDE agent
+# runtime) to the dotted Aegis capabilities they require. A consuming
+# host that receives a tool call by name (Bash, Read, Edit, WebFetch...)
+# looks up the name here, gets back the implied capabilities, and
+# verifies each against [functions].allow before invoking the tool.
+# Default-deny: a tool not declared here is rejected.
+Read     = ["fs.read"]
+Edit     = ["fs.read", "fs.write"]
+Write    = ["fs.write"]
+Bash     = ["subprocess.exec"]
+WebFetch = ["net.http_get"]
+
 # ----- Capability allowlist -----
 [functions]
 # Which capabilities the script may reference at all. Names are dotted
@@ -416,7 +430,8 @@ To consume this spec from your own agent host:
    context. Selection MUST be host-driven, not derivable from the
    agent's prompt.
 
-A common mapping for a Claude-Code-style host:
+A common mapping for a Claude-Code-style host (preferably declared
+in the policy's `[tools]` block rather than hardcoded in the host):
 
 | Tool                       | Capability(ies)                      |
 |----------------------------|--------------------------------------|
@@ -426,6 +441,18 @@ A common mapping for a Claude-Code-style host:
 | `WebFetch` / `WebSearch`   | `net.http_get`                       |
 | `Task` (subagent)          | inherits parent policy by default    |
 | MCP tools                  | per-server, mapped by tool name      |
+
+When a host receives a tool call by name (e.g. `Bash {command: "ls"}`),
+the recommended dispatch is:
+
+1. `Policy::check_tool("Bash")` returns `["subprocess.exec"]` if
+   declared and all capabilities are allowed.
+2. The host verifies any tool-specific args against the relevant
+   capability checks (e.g. `policy.check_subprocess_command(...)`
+   for the leading argv token).
+3. Tool runs, audit event is emitted with the resolved capability
+   names so a reviewer can correlate "Bash ran" to "subprocess.exec
+   was used".
 
 ## Reference policies
 
@@ -500,6 +527,7 @@ The honest picture:
 | `[subprocess].allow_commands` / `deny_commands` | ✅ enforced |
 | `[subprocess.deny_args]`         | ✅ enforced (substring on joined argv[1..]) |
 | `[functions].allow` / `deny`     | ✅ enforced (verifier + runtime) |
+| `[tools]` mapping                | ✅ exposed via Policy::check_tool for hosts that consult Aegis as a policy oracle |
 | `confirm_per_call`               | ✅ enforced |
 | `inherits` (presets)             | ✅ resolved at load |
 

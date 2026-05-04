@@ -34,6 +34,8 @@ pub enum PolicyError {
     },
     #[error("policy denies call to function {name:?}: {reason}")]
     FunctionDenied { name: String, reason: String },
+    #[error("policy denies tool {name:?}: {reason}")]
+    ToolDenied { name: String, reason: String },
     #[error("policy denies env var {name:?}: {reason}")]
     EnvDenied { name: String, reason: String },
     #[error("policy denies subprocess command {command:?}: {reason}")]
@@ -83,6 +85,17 @@ pub struct PolicyFile {
     pub subprocess: SubprocessPolicy,
     #[serde(default)]
     pub functions: FunctionPolicy,
+    /// Map from external tool names (as exposed by an MCP host or an
+    /// IDE agent runtime) to the dotted Aegis capability names the
+    /// tool requires. A consuming host that receives a tool call (e.g.
+    /// `Bash {command: "ls"}`) looks up `Bash` here, gets back
+    /// `["subprocess.exec"]`, and verifies each capability against
+    /// `[functions].allow` before invoking the tool.
+    ///
+    /// Default-deny: a tool not declared here is rejected by
+    /// `Policy::check_tool`.
+    #[serde(default)]
+    pub tools: std::collections::BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub confirm_per_call: Vec<String>,
 }
@@ -207,6 +220,30 @@ fn concat_dedup(mut base: Vec<String>, over: Vec<String>) -> Vec<String> {
     base
 }
 
+/// Merge `[tools]` maps. Per-key concat-with-dedup-and-negation,
+/// matching the deny_args merge shape. A user file entry of the form
+/// `"!fs.write"` removes that capability from an inherited tool's
+/// required-capability list. If a tool's required-capability list
+/// becomes empty after merge, it remains in the map (the tool stays
+/// declared but requires no capabilities — caller decides whether
+/// that's meaningful).
+fn merge_tools(
+    mut base: std::collections::BTreeMap<String, Vec<String>>,
+    over: std::collections::BTreeMap<String, Vec<String>>,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    for (k, v) in over {
+        let entry = base.entry(k).or_default();
+        for item in v {
+            if let Some(target) = item.strip_prefix('!') {
+                entry.retain(|s| s != target);
+            } else if !entry.contains(&item) {
+                entry.push(item);
+            }
+        }
+    }
+    base
+}
+
 fn merge_deny_args(
     mut base: std::collections::BTreeMap<String, Vec<String>>,
     over: std::collections::BTreeMap<String, Vec<String>>,
@@ -296,6 +333,7 @@ fn merge_policy_files(base: PolicyFile, over: PolicyFile) -> PolicyFile {
             allow: concat_dedup(base.functions.allow, over.functions.allow),
             deny: concat_dedup(base.functions.deny, over.functions.deny),
         },
+        tools: merge_tools(base.tools, over.tools),
         confirm_per_call: concat_dedup(base.confirm_per_call, over.confirm_per_call),
     }
 }
@@ -327,6 +365,7 @@ pub struct Policy {
     subprocess_deny_args: std::collections::BTreeMap<String, Vec<String>>,
     fn_allow: Vec<String>,
     fn_deny: Vec<String>,
+    tools: std::collections::BTreeMap<String, Vec<String>>,
     confirm_per_call: Vec<String>,
 }
 
@@ -376,6 +415,7 @@ impl Policy {
         let subprocess_deny_args = file.subprocess.deny_args.clone();
         let fn_allow = file.functions.allow.clone();
         let fn_deny = file.functions.deny.clone();
+        let tools = file.tools.clone();
         let confirm_per_call = file.confirm_per_call.clone();
         Ok(Self {
             file,
@@ -398,6 +438,7 @@ impl Policy {
             subprocess_deny_args,
             fn_allow,
             fn_deny,
+            tools,
             confirm_per_call,
         })
     }
@@ -408,6 +449,29 @@ impl Policy {
 
     pub fn confirm_required(&self, capability: &str) -> bool {
         self.confirm_per_call.iter().any(|c| c == capability)
+    }
+
+    /// Look up `name` in `[tools]`. Returns the list of capabilities
+    /// the tool requires if it's declared AND every capability is
+    /// permitted by `[functions].allow`. Default-deny: an undeclared
+    /// tool is rejected.
+    ///
+    /// This is the entry point for hosts that consult Aegis as a
+    /// policy oracle — they receive a tool call by name (Bash, Read,
+    /// Edit, WebFetch...) and want a yes/no plus the implied
+    /// capabilities to log alongside the action.
+    pub fn check_tool(&self, name: &str) -> Result<&[String], PolicyError> {
+        let caps = self.tools.get(name).ok_or_else(|| PolicyError::ToolDenied {
+            name: name.to_string(),
+            reason: "tool not declared in [tools]".into(),
+        })?;
+        for cap in caps {
+            self.check_function(cap).map_err(|e| PolicyError::ToolDenied {
+                name: name.to_string(),
+                reason: format!("required capability {cap:?} not allowed: {e}"),
+            })?;
+        }
+        Ok(caps.as_slice())
     }
 
     pub fn check_function(&self, name: &str) -> Result<(), PolicyError> {
@@ -1293,6 +1357,62 @@ allow = ["subprocess.exec"]
             .any(|c| c == "subprocess.exec"));
         // fs.delete is still prompt-gated.
         assert!(file.confirm_per_call.iter().any(|c| c == "fs.delete"));
+    }
+
+    #[test]
+    fn tools_block_lookup_and_capability_check() {
+        let toml = r#"
+[tools]
+Read = ["fs.read"]
+Edit = ["fs.read", "fs.write"]
+Bash = ["subprocess.exec"]
+WebFetch = ["net.http_get"]
+
+[functions]
+allow = ["fs.read", "net.http_get"]
+"#;
+        let file = PolicyFile::from_toml_str(toml).unwrap();
+        let p = Policy::from_file(file, PathBuf::from("/work")).unwrap();
+        // Read needs fs.read which is allowed → ok
+        let caps = p.check_tool("Read").unwrap();
+        assert_eq!(caps, &["fs.read"]);
+        // WebFetch needs net.http_get → ok
+        assert!(p.check_tool("WebFetch").is_ok());
+        // Edit needs fs.write which is NOT allowed → tool denied
+        let err = p.check_tool("Edit").unwrap_err().to_string();
+        assert!(err.contains("Edit"), "{err}");
+        assert!(err.contains("fs.write"), "{err}");
+        // Bash needs subprocess.exec → not allowed
+        assert!(p.check_tool("Bash").is_err());
+        // Tool not declared in [tools] → denied
+        let err = p.check_tool("UnknownTool").unwrap_err().to_string();
+        assert!(err.contains("not declared"), "{err}");
+    }
+
+    #[test]
+    fn tools_inherit_and_extend_via_merge() {
+        // Conceptually: a preset declares standard tools, the user
+        // file extends with project-specific ones and can `!`-remove
+        // a capability requirement from an inherited tool.
+        let base_toml = r#"
+[tools]
+Read = ["fs.read"]
+Bash = ["subprocess.exec"]
+"#;
+        let over_toml = r#"
+[tools]
+Bash = ["!subprocess.exec"]    # un-require subprocess.exec for Bash (e.g., shadow Bash)
+WebFetch = ["net.http_get"]    # add a new tool
+"#;
+        let base = PolicyFile::from_toml_str(base_toml).unwrap();
+        let over = PolicyFile::from_toml_str(over_toml).unwrap();
+        let merged = merge_policy_files(base, over);
+        assert_eq!(merged.tools.get("Read").unwrap(), &vec!["fs.read".to_string()]);
+        assert!(merged.tools.get("Bash").unwrap().is_empty());
+        assert_eq!(
+            merged.tools.get("WebFetch").unwrap(),
+            &vec!["net.http_get".to_string()]
+        );
     }
 
     #[test]
