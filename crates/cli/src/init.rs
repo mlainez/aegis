@@ -417,6 +417,15 @@ allow_commands = [
     "git",
     "make",
 ]
+# `secure-defaults` denies the ruby interpreter wholesale because
+# `ruby -e "<code>"` runs arbitrary Ruby with full filesystem +
+# network access — bypassing the argv path-gate (the path is
+# constructed at runtime inside the inline string). The Ruby
+# language template needs `ruby` to function, so we negate the
+# deny — and accept the privilege grant. `bundle exec`, `rake`,
+# `rails`, etc. ultimately run Ruby too, but they're project-bound
+# (Rakefile, Gemfile) and not generic exec surfaces.
+deny_commands = ["!ruby"]
 
 [subprocess.deny_args]
 git = [
@@ -439,6 +448,11 @@ rails = ["db:drop", "db:reset", "destroy"]
 # Block bundle publish by default.
 bundle = ["publish"]
 gem = ["push"]
+# Block inline-execution flags. `ruby -e "<code>"` runs arbitrary
+# Ruby; the argv path-gate cannot reason about what the inline
+# code will open. Force the agent to use real .rb files which DO
+# go through fs.read/write gates.
+ruby = ["-e", "-r"]
 
 # Capabilities are auto-derived from the populated resource sections
 # above. Populate [network].http_get_allow to enable net.http_get.
