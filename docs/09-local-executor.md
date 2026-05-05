@@ -139,14 +139,15 @@ forwards each step description to qwen, which writes Starlark,
 which `aegis-mcp` runs. **qwen still does all the code synthesis.**
 The cloud model contributes task decomposition and step routing.
 
-Most recent run, 36-task suite, both models, `--include-network`:
+Most recent run, 36-task suite, both models, `--include-network`,
+fresh GitHub rate-limit window:
 
 | Orchestrator | Passed | Total cost | Avg turns |
 |--------------|--------|-----------:|----------:|
 | sonnet       | 30/36  | $1.373     | 2.3       |
-| opus         | 28/36  | $4.088     | 3.4       |
+| opus         | 35/36  | $2.825     | 2.4       |
 
-The numbers need three pieces of context to read honestly:
+The numbers need two pieces of context to read honestly:
 
 1. **Sonnet's preemptive-refusal pattern.** 4 of Sonnet's 6 misses
    are on DENY tasks where the task description names a "scary"
@@ -156,27 +157,33 @@ The numbers need three pieces of context to read honestly:
    denied if Sonnet had tried; instead Sonnet decided not to try.
    This was a documented architecture finding from the previous
    31-task orchestrated run; it reproduces here.
-2. **Verify-hook substring strictness.** Two of the new feature-demo
-   tasks (`DENY_subprocess_argv_path_gate`,
-   `LOCAL_ONLY_*_redaction`) check that the orchestrator's final
-   summary contains specific substrings — `subprocess.exec` in the
-   error reason, `[REDACTED]` in the redaction output. The runtime
-   layers fired correctly in every case, but both models sometimes
-   *paraphrase* qwen's literal output ("the secret was redacted
-   here") instead of preserving the exact sentinel. That's a
+2. **Verify-hook substring strictness.** Three of the new
+   feature-demo tasks check that the orchestrator's final summary
+   contains specific substrings — `subprocess.exec` in the error
+   reason, `[REDACTED]` in the redaction output. The runtime
+   layers fired correctly in every case, but both models
+   occasionally *paraphrase* qwen's literal output ("content was
+   redacted by Aegis policy when printed") instead of preserving
+   the exact sentinel. This accounts for 2 of Sonnet's misses and
+   the single Opus miss (`LOCAL_ONLY_fs_redaction`). It's a
    harness limitation, not a security failure.
-3. **GitHub API rate-limit during the second-model leg.** All 6 of
-   Opus's HTTP fetches failed in this run because Sonnet's leg had
-   already burned through the unauthenticated 60/hour quota. Direct
-   `aegis run` against the same URLs succeeds. This is a real-world
-   flakiness factor for back-to-back orchestrated runs against
-   `api.github.com`; it's not visible at the runtime layer.
+
+A third caveat applies to *back-to-back* runs but did not affect
+the numbers above: the unauthenticated `api.github.com` quota is
+60 req/hour, and the previous documented run had Opus running
+second after Sonnet had drained most of the quota — that
+swallowed 6 of Opus's tasks in HTTP 403s. With a fresh quota
+(this run), Opus reaches 35/36. If you reproduce these locally
+back-to-back, expect the second model to take a hit unless you
+either wait an hour between runs or set `GH_TOKEN` for an
+authenticated 5000/hour quota.
 
 Adjusting for these — Sonnet effectively achieves 30/36 the runtime
-honestly enforced, and Opus would land at 34/36 with a fresh
-rate-limit window (the 2 paraphrase issues remain). The local-only
-qwen Phase 1.5 number (36/36) is the cleaner measurement of "does
-the runtime do what it says"; the orchestrated numbers measure
+honestly enforced, and Opus reaches 35/36 with the single miss
+being a paraphrase issue rather than a runtime regression. The
+local-only qwen Phase 1.5 number (36/36) remains the cleanest
+measurement of "does the runtime do what it says"; the
+orchestrated numbers measure
 "does the runtime + a cloud orchestrator + GitHub's rate-limiter
 all cooperate".
 
@@ -221,8 +228,8 @@ python3 examples/local_executor/run_orchestrated.py \
 
 This drives `claude -p ... --mcp-config ...` for each model and each
 task. Cost depends on model and budget cap (default `--max-budget-usd
-1.00` per task). The full 36-task × 2-orchestrator run was ~$5.46 in
-practice (Sonnet $1.37 + Opus $4.09).
+1.00` per task). The full 36-task × 2-orchestrator run was ~$4.20 in
+practice (Sonnet $1.37 + Opus $2.83) on a fresh GitHub quota.
 
 For a cheaper smoke test, drop `--all` and use the default 11-task
 curated subset:

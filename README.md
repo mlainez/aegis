@@ -139,11 +139,13 @@ predecessor project, [Sigil](docs/02-from-sigil.md). It plateaued at
 7/30 multi-step tasks. Aegis with **stock qwen-7B alone** (no cloud
 orchestrator) reaches 36/36 on the current 36-task suite. Layered
 with Sonnet/Opus orchestration on top of qwen+Aegis on the same
-36-task suite: Sonnet 30/36, Opus 28/36 — the orchestrated failures
+36-task suite: Sonnet 30/36, Opus 35/36 — the orchestrated misses
 are model-side artifacts (Sonnet preemptively refuses some DENY
-tasks; Opus burns turns through a GitHub API rate-limit), not
-runtime-side. See [docs/09-local-executor.md](docs/09-local-executor.md)
-for the per-failure breakdown.)
+tasks; Opus paraphrases the literal `[REDACTED]` sentinel one
+verify hook substring-matches on). The runtime denies and redacts
+correctly in every case. See
+[docs/09-local-executor.md](docs/09-local-executor.md) for the
+per-failure breakdown.)
 
 **"Extend only with what we need"** flips the security model inside
 out. Default Python is *"everything works, lock it down by
@@ -231,11 +233,14 @@ Pre-1.0. The runtime is solid; the eval harness reproduces stable
 numbers (qwen 7B alone: **36/36** on the current 36-task suite, which
 includes 5 feature-demo tasks pinning specific runtime layers;
 Sonnet-orchestrated on the same suite: **30/36 / $1.37**;
-Opus-orchestrated: **28/36 / $4.09**). The orchestrated gap is
-model-side, not runtime-side — Aegis denies/redacts correctly in
-every case; the orchestrators sometimes refuse tasks they should
-attempt or get rate-limited by GitHub mid-run. Per-failure
-breakdown in [docs/09-local-executor.md](docs/09-local-executor.md).
+Opus-orchestrated: **35/36 / $2.83**). The orchestrated gap is
+model-side, not runtime-side — Aegis denies and redacts correctly
+in every case; Sonnet sometimes preemptively refuses DENY tasks
+it should attempt, and the single Opus miss is a verify-hook
+substring strictness issue where the orchestrator paraphrased
+the redaction outcome instead of preserving the literal
+`[REDACTED]` sentinel. Per-failure breakdown in
+[docs/09-local-executor.md](docs/09-local-executor.md).
 The policy spec is portable and documented. APIs may still change.
 
 ## Roadmap to production-readiness

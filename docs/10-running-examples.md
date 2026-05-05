@@ -20,7 +20,7 @@ place:
 | `run.py`                | qwen2.5-coder:7b alone, 10 single-step tasks               | **10/10**     | $0         | Smoke test — your install is wired correctly, every capability gate fires once. |
 | `run_multistep.py`      | qwen2.5-coder:7b alone + RAG + 1-retry, 36 multi-step      | **36/36**     | $0         | The headline number. Local 7B + Aegis with no cloud orchestrator passes the full suite, including 5 feature-demo tasks pinning recent security fixes. |
 | `run_orchestrated.py`   | Sonnet → qwen+Aegis, 36-task suite                         | **30/36**     | **$1.37**  | Cloud orchestrator on top of the same stack; 6 misses are model-side artifacts (refusal pattern + paraphrase). |
-| `run_orchestrated.py`   | Opus → qwen+Aegis, 36-task suite                           | **28/36**     | **$4.09**  | Same shape; 8 misses split between paraphrase, refusal, and a GitHub API rate-limit hit during the longer run. |
+| `run_orchestrated.py`   | Opus → qwen+Aegis, 36-task suite (fresh GitHub quota)      | **35/36**     | **$2.83**  | Same shape; the single miss is a verify-hook substring strictness issue (Opus paraphrased `[REDACTED]`). |
 
 ### How to read these
 
@@ -40,8 +40,8 @@ place:
   | Bucket | Why it fails the verify hook | Counts as a runtime bug? |
   |--------|------------------------------|--------------------------|
   | Sonnet preemptive refusal on DENY tasks | The orchestrator recognises a task as "obviously unsafe" (`/etc/passwd`, `AWS_SECRET_ACCESS_KEY`, IMDS SSRF) and refuses to delegate any step. Aegis would have correctly denied if it had been called. | No — the refusal is at a *higher* layer than the gate, not a bypass. |
-  | Verify-hook substring strictness on LOCAL_ONLY tasks | Aegis correctly substitutes `[REDACTED]` in the redacted output; the orchestrator then paraphrases qwen's literal output ("the secret was redacted") instead of preserving the sentinel verbatim, and the verify hook does a substring match. | No — the redaction worked; the test is over-strict on output format. |
-  | `api.github.com` 60-req/hour rate-limit | Opus uses more turns/task; the back half of its run hits 403s when the unauthenticated GitHub quota runs out. | No — direct `aegis run` against the same URLs succeeds. |
+  | Verify-hook substring strictness on LOCAL_ONLY / argv-gate tasks | Aegis correctly substitutes `[REDACTED]` in the redacted output and surfaces `subprocess.exec` in argv-gate errors; the orchestrator then paraphrases qwen's literal output ("content was redacted by Aegis policy") instead of preserving the sentinel verbatim, and the verify hook does a substring match. | No — the redaction/denial worked; the test is over-strict on output format. |
+  | `api.github.com` 60-req/hour rate-limit *(only affects back-to-back runs)* | If you run two models back-to-back without setting `GH_TOKEN`, the second model's HTTP fetches will mostly 403. Not a factor in the numbers above (run on a fresh quota). | No — direct `aegis run` against the same URLs succeeds; this is an environmental flake, not a runtime issue. |
 
 - **What this implies for "how good is Aegis."** The runtime layer
   is at parity with itself across single-step, multi-step, and
@@ -52,7 +52,7 @@ place:
 
 - **What this implies for cost.** The orchestrated mode buys you
   task decomposition and step routing for ~$0.04/task (Sonnet) to
-  ~$0.11/task (Opus). The local-only mode is free per task at the
+  ~$0.08/task (Opus). The local-only mode is free per task at the
   cost of a one-time `ollama pull` (~5 GB).
 
 The full per-failure breakdown for the orchestrated run lives in
@@ -187,12 +187,13 @@ through `aegis-mcp` under your project policy.
 python3 examples/local_executor/run_orchestrated.py --models sonnet opus --all
 ```
 
-Expected (full 36-task suite, two orchestrators):
+Expected (full 36-task suite, two orchestrators, fresh GitHub
+rate-limit window):
 
 | Orchestrator | Passed | Total cost | Avg turns/task |
 |--------------|-------:|-----------:|---------------:|
 | sonnet       | 30/36  | $1.37      | 2.3            |
-| opus         | 28/36  | $4.09      | 3.4            |
+| opus         | 35/36  | $2.83      | 2.4            |
 
 Each delegated step is a separate API call. Cost depends on the
 model and per-task budget (default `--max-budget-usd 1.00`).
@@ -200,20 +201,24 @@ model and per-task budget (default `--max-budget-usd 1.00`).
 The orchestrated scores trail the qwen-alone 36/36 because of
 *orchestrator-side* artifacts, not runtime-side regressions:
 
-- **Sonnet preemptive refusal on some DENY tasks** (~4 fails). The
-  cloud model recognises a task as "obviously unsafe" and refuses
-  to delegate it, so the runtime never gets to demonstrate the
-  policy gate firing. The DENY tasks are designed to *prove the
-  gate works* — a refusal at the orchestrator layer is a different
-  (also-fine) outcome the verify hook doesn't credit.
-- **Verify-hook substring strictness on LOCAL_ONLY tasks** (~2
-  fails). The redaction in the runtime correctly replaces the
-  secret with `[REDACTED]`; the orchestrator then paraphrases the
-  step output and the literal substring `[REDACTED]` doesn't
-  always survive verbatim.
-- **`api.github.com` rate-limit during the longer Opus leg** (~6
-  fails). Unauthenticated GitHub API is 60 req/hour; Opus uses
-  more turns/task, so the back half of the run hits 403s.
+- **Sonnet preemptive refusal on some DENY tasks** (~4 of Sonnet's
+  6 fails). The cloud model recognises a task as "obviously
+  unsafe" and refuses to delegate it, so the runtime never gets to
+  demonstrate the policy gate firing. The DENY tasks are designed
+  to *prove the gate works* — a refusal at the orchestrator layer
+  is a different (also-fine) outcome the verify hook doesn't
+  credit.
+- **Verify-hook substring strictness on LOCAL_ONLY tasks** (~2 of
+  Sonnet's misses + the single Opus miss). The redaction in the
+  runtime correctly replaces the secret with `[REDACTED]`; the
+  orchestrator then paraphrases the step output ("content was
+  redacted by Aegis policy") and the literal substring
+  `[REDACTED]` doesn't survive verbatim.
+- **`api.github.com` rate-limit if you run back-to-back without
+  `GH_TOKEN`.** Not a factor in the numbers above (this run had a
+  fresh 60-req quota). If you run two models in sequence, the
+  second one will mostly 403 on HTTP tasks unless you wait an
+  hour or set an authenticated token.
 
 None of these are runtime-side bugs. The runtime denies and redacts
 correctly in every case where it's invoked.
@@ -283,7 +288,7 @@ default run.
 |----------|------------------|
 | qwen-7B 36/36 (fresh URLs) | `python3 examples/local_executor/run_multistep.py` |
 | Sonnet 30/36 / $1.37 | `python3 examples/local_executor/run_orchestrated.py --models sonnet --all` |
-| Opus 28/36 / $4.09 | `python3 examples/local_executor/run_orchestrated.py --models opus --all` |
+| Opus 35/36 / $2.83 | `python3 examples/local_executor/run_orchestrated.py --models opus --all` |
 | Single-step 10/10 | `python3 examples/local_executor/run.py` |
 
 Each number is the result of a single run — they're stable to

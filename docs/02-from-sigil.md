@@ -241,15 +241,16 @@ choices in Aegis:
   version of the suite before some hardcoded URLs were refreshed and
   the redirect-blocking fix landed.)
 - **Aegis with cloud orchestrator layered on top of qwen+Aegis (same
-  36-task suite):** Sonnet **30/36 / $1.37**, Opus **28/36 / $4.09**.
+  36-task suite):** Sonnet **30/36 / $1.37**, Opus **35/36 / $2.83**.
   In this mode the cloud model only does task decomposition and step
   routing; qwen still writes every Starlark program. The orchestrated
   scores trail qwen-alone because of orchestrator-side artifacts, not
   runtime-side regressions: Sonnet preemptively refuses some DENY tasks
   it should *attempt* (so the runtime never gets to demonstrate the
-  gate firing), and Opus burns turns through a `api.github.com`
-  rate-limit during the longer run. The runtime denies correctly and
-  redacts correctly in every case where it's invoked. See
+  gate firing), and the single Opus miss is a verify-hook substring
+  strictness issue where the orchestrator paraphrased qwen's literal
+  `[REDACTED]` sentinel. The runtime denies correctly and redacts
+  correctly in every case where it's invoked. See
   [09-local-executor.md](09-local-executor.md) for the per-failure
   breakdown.
 
