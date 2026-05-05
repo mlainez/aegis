@@ -129,6 +129,10 @@ deny_hosts = ["evil-exfil.example.com"]
 # `secure-defaults` already lists 169.254.169.254. Add project-specific
 # IPs/CIDRs here.
 deny_ips = []
+# Per-call HTTP timeout. Defaults to 30 seconds when unset. Applies
+# uniformly to every `net.http_*` verb. Tighten this to keep an
+# unhealthy backend from hanging the agent.
+timeout_seconds = 30
 
 # ----- Environment -----
 [environment]
@@ -345,6 +349,13 @@ allowed.
   the IP layer; full defense against DNS rebinding requires
   resolved-IP pinning passed into the HTTP client, which is beyond
   v1.
+- `timeout_seconds` (optional) bounds each individual `net.http_*`
+  call. Implementations SHOULD apply it as the total request
+  timeout (connect + read + write); a request that fails to
+  complete within the budget surfaces as a runtime error. Default
+  in Aegis is 30 seconds when unset. Keeping the timeout low (5–10s)
+  is a defense-in-depth against unhealthy backends hanging the
+  agent indefinitely.
 
 ### Subprocess matching
 
@@ -545,12 +556,17 @@ The honest picture:
 | `[network]` http_put / patch / delete | ✅ enforced |
 | `[network]` deny_hosts (glob)    | ✅ enforced |
 | `[network]` deny_ips (literal + CIDR) | ✅ enforced; DNS-resolves hostnames and checks each A/AAAA |
-| `[environment]` allow_vars / deny_vars | ✅ enforced |
-| `[subprocess].allow_commands` / `deny_commands` | ✅ enforced |
+| `[network].timeout_seconds`      | ✅ enforced; per-call HTTP total-time deadline (default 30s) |
+| `[environment]` allow_vars / local_only_vars / deny_vars | ✅ enforced; subprocess child env is filtered to declared vars only |
+| `[subprocess].allow_commands` / `local_only_commands` / `deny_commands` | ✅ enforced |
 | `[subprocess.deny_args]`         | ✅ enforced (substring on joined argv[1..]) |
+| `[runtime].max_seconds`          | ✅ enforced at every effecting capability call; pure CPU loops not caught (run inside a container for full isolation) |
+| `[runtime].max_callstack_size`   | ✅ enforced via Starlark Evaluator |
+| `[filesystem].local_only_read` / `[network].local_only_hosts` | ✅ enforced; values tainted at output boundary (printed, audit, MCP result) |
 | Derived capability set            | ✅ enforced (verifier + runtime); auto-derived from populated resource sections, no `[functions]` block |
-| `[tools]` mapping                | ✅ exposed via Policy::check_tool for hosts that consult Aegis as a policy oracle |
-| `confirm_per_call`               | ✅ enforced |
+| `[tools]` short and long form     | ✅ enforced via Policy::check_tool; long form's backend_url / backend_method routing hints exposed via Policy::tool_routing for bridge layers |
+| `confirm_per_call`               | ✅ enforced via ConfirmHook; `aegis-mcp --confirm-mode {auto-allow,auto-deny}` selects behavior; auto-deny tags response with `aegis_error_kind: "confirm_denied"` for orchestrator branching |
+| Self-writable guard              | ✅ enforced at load — refuses any policy whose write_allow / delete_allow matches the policy file itself |
 | `inherits` (presets)             | ✅ resolved at load |
 
 If your project needs database-level access control or a

@@ -166,6 +166,18 @@ pub struct NetworkPolicy {
     /// resolution rules in EnvironmentPolicy::local_only_vars docs).
     #[serde(default)]
     pub local_only_hosts: Vec<String>,
+    /// Per-call HTTP timeout in seconds. Applies to every
+    /// `net.http_*` builtin uniformly. `None` (the default) means
+    /// "use the built-in default of 30s"; set to a positive value
+    /// to tighten or loosen, set to a very small value (e.g. 1) to
+    /// keep an unhealthy backend from hanging the agent.
+    ///
+    /// Note: this is the *total* request timeout, not connect/read
+    /// individually. A request that fails to complete within the
+    /// budget surfaces as a runtime error from the affected
+    /// builtin.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
 }
 
 // FunctionPolicy was removed. Capabilities are now derived from the
@@ -503,6 +515,7 @@ fn merge_policy_files(base: PolicyFile, over: PolicyFile) -> PolicyFile {
                 base.network.local_only_hosts,
                 over.network.local_only_hosts,
             ),
+            timeout_seconds: over.network.timeout_seconds.or(base.network.timeout_seconds),
         },
         environment: EnvironmentPolicy {
             allow_vars: concat_dedup(
@@ -990,6 +1003,16 @@ impl Policy {
     /// effecting capability calls. `None` ⇒ no limit.
     pub fn runtime_max_seconds(&self) -> Option<u64> {
         self.file.runtime.max_seconds
+    }
+
+    /// Resolved HTTP per-call timeout. Defaults to 30 seconds when
+    /// `[network].timeout_seconds` is unset; otherwise honors the
+    /// configured value. The host crate calls this for every
+    /// `net.http_*` request to keep an unhealthy backend from
+    /// hanging the agent indefinitely.
+    pub fn network_timeout(&self) -> std::time::Duration {
+        let secs = self.file.network.timeout_seconds.unwrap_or(30);
+        std::time::Duration::from_secs(secs)
     }
 
     /// Max Starlark call-stack depth. `None` ⇒ Starlark's default.

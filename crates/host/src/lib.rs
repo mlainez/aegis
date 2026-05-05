@@ -641,7 +641,9 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
                 ctx.require_confirm("net.http_get", format!("GET {}", parsed))?;
                 let host_label = parsed.host_str().map(|s| s.to_string()).unwrap_or_default();
                 let result: Result<String, anyhow::Error> = (|| {
-                    let resp = ureq::get(parsed.as_str()).call()?;
+                    let resp = ureq::get(parsed.as_str())
+                        .timeout(ctx.policy.network_timeout())
+                        .call()?;
                     Ok(resp.into_string()?)
                 })();
                 if let Ok(body) = result.as_ref() {
@@ -703,7 +705,9 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
                 )?;
                 let host_label = parsed.host_str().map(|s| s.to_string()).unwrap_or_default();
                 let result: Result<String, anyhow::Error> = (|| {
-                    let resp = ureq::post(parsed.as_str()).send_string(body)?;
+                    let resp = ureq::post(parsed.as_str())
+                        .timeout(ctx.policy.network_timeout())
+                        .send_string(body)?;
                     Ok(resp.into_string()?)
                 })();
                 if let Ok(b) = result.as_ref() {
@@ -765,7 +769,9 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
                 )?;
                 let host_label = parsed.host_str().map(|s| s.to_string()).unwrap_or_default();
                 let result: Result<String, anyhow::Error> = (|| {
-                    let resp = ureq::put(parsed.as_str()).send_string(body)?;
+                    let resp = ureq::put(parsed.as_str())
+                        .timeout(ctx.policy.network_timeout())
+                        .send_string(body)?;
                     Ok(resp.into_string()?)
                 })();
                 if let Ok(b) = result.as_ref() {
@@ -827,7 +833,9 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
                 )?;
                 let host_label = parsed.host_str().map(|s| s.to_string()).unwrap_or_default();
                 let result: Result<String, anyhow::Error> = (|| {
-                    let resp = ureq::patch(parsed.as_str()).send_string(body)?;
+                    let resp = ureq::patch(parsed.as_str())
+                        .timeout(ctx.policy.network_timeout())
+                        .send_string(body)?;
                     Ok(resp.into_string()?)
                 })();
                 if let Ok(b) = result.as_ref() {
@@ -885,7 +893,9 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
                 ctx.require_confirm("net.http_delete", format!("DELETE {}", parsed))?;
                 let host_label = parsed.host_str().map(|s| s.to_string()).unwrap_or_default();
                 let result: Result<String, anyhow::Error> = (|| {
-                    let resp = ureq::delete(parsed.as_str()).call()?;
+                    let resp = ureq::delete(parsed.as_str())
+                        .timeout(ctx.policy.network_timeout())
+                        .call()?;
                     Ok(resp.into_string()?)
                 })();
                 if let Ok(b) = result.as_ref() {

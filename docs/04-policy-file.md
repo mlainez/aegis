@@ -191,6 +191,7 @@ unwritable, the guard lets the policy load.
 | `local_only_hosts`  | Hosts permitted for any verb; response bodies are tainted        |
 | `deny_hosts`        | Hosts always denied (deny wins)                                  |
 | `deny_ips`          | IP literals or CIDR ranges always denied; checked at DNS resolution |
+| `timeout_seconds`   | Per-call HTTP timeout in seconds. Defaults to 30. Applies uniformly to every `net.http_*` builtin. Set low (e.g. 5) to keep an unhealthy backend from hanging the agent. |
 
 Host patterns use the same glob syntax (so `*.npmjs.org` matches
 `registry.npmjs.org` and `www.npmjs.org`). `deny_ips` accepts both
