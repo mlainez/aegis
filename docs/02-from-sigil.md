@@ -15,6 +15,128 @@ history that justifies why Aegis looks the way it does. The deep
 retrospective notes live in [CONCLUSIONS.md](CONCLUSIONS.md); this is the
 condensed version.
 
+## The design principle that fell out of the retrospective
+
+If the entire two-project history compressed into one sentence, it
+would be:
+
+> **Start from a limited language the current models already know
+> the syntax of, then extend only with what we need.**
+
+This is the load-bearing decision Aegis is built around. It's worth
+unpacking carefully because the alternative paths each fail in
+specific, instructive ways.
+
+### Why "a limited language the models already know"
+
+Modern LLMs are trained on hundreds of billions of tokens of source
+code, with Python over-represented. They don't *know* a custom DSL.
+They *have seen* Python ten million times. That asymmetry is gigantic
+and growing.
+
+A custom DSL has to compete with that asymmetry by either:
+- **Fine-tuning models to emit the DSL natively** (expensive,
+  per-checkpoint, never quite generalizes — Sigil's path), or
+- **Telling the model in a system prompt how the DSL works**
+  (works for trivial syntax; fights pre-training every step for
+  anything richer)
+
+Stock Starlark + a system prompt that names three rules ("no
+imports, no f-strings, no top-level for/if") gets a stock 7B model
+to ~90% on first-try multi-step code synthesis with no fine-tuning
+at all. The remaining 10% closes with retrieval-augmented examples
+and a single validator-in-loop retry. The pre-training base does
+the heavy lifting; we only have to nudge it across the small
+syntactic gap to a stricter dialect of something it already speaks
+fluently.
+
+Pre-training is the most expensive thing OpenAI / Anthropic / Meta
+are doing. *We get to free-ride on it for free, every time a new
+model ships.* That's a structural advantage no fine-tuned bespoke
+DSL can match — when GPT-5 lands, it's better at Starlark out of
+the box; we ship nothing and get the upgrade. With a bespoke DSL,
+we'd have to retrain on the new base every time.
+
+### Why "extend only with what we need"
+
+This is the deeper of the two halves, and the one that makes Aegis
+a *security* tool rather than just a convenience.
+
+Default Python is the maximally-permissive baseline. Anything in
+the stdlib is reachable: `os.system`, `subprocess.Popen`, `socket`,
+`ctypes`, `eval`, `exec`, `__import__`, `pickle.loads`, you name
+it. Every Python sandbox ever shipped — `restrictedpython`, PyPy's
+sandbox mode, Skulpt, every "safe Python" wrapper on the third
+page of HN — has tried to subtract from this baseline. Each has
+also shipped with documented bypasses. The CVE backlogs are public.
+The pattern is clear: **subtraction-based safety on a permissive
+base never converges.** There's always one more dunder, one more
+descriptor, one more reflection trick.
+
+Starlark inverts this. The baseline is "nothing reaches outside the
+evaluator." No filesystem, no network, no clock, no random, no
+imports, no exec/eval, no threads, no `os`, no `sys`, no `__import__`.
+That's not a list of things we removed; that's the *starting state*
+of the language. Bazel and Buck need it that way for build-graph
+hermeticity (same input must always yield same output, byte for
+byte), and that hermeticity is exactly what we'd want from a
+security baseline anyway.
+
+Then we *add* the effects we explicitly want, one at a time, under
+typed gates:
+
+```
+fs.read(path: str) -> str        # read this file, if policy allows
+net.http_get(url: str) -> str    # fetch this URL, if policy allows
+subprocess.exec(argv) -> str     # run this argv, if policy allows
+env.read(name: str) -> str       # read this env var, if policy allows
+```
+
+Every one of those goes through a typed Rust function that consults
+the policy, audits the call, optionally requires confirmation, and
+runs the actual side effect only if all of those said yes. The
+script literally cannot reach `os.system` because there is no `os`
+module. It can't even *name* `os`. The runtime doesn't need to lock
+it down because it was never there.
+
+The properties this gives us:
+
+- **The attack surface IS the capability list.** What Aegis can do
+  unsafely is exactly the set of effecting builtins we wrote. Ten
+  functions. They fit on one screen. We can read them all and
+  reason about them.
+- **Adding a capability is a deliberate, named, reviewable act.**
+  Every new builtin gets a `Policy::check_*` gate, an audit event,
+  test coverage. New surface lands in PRs that are easy to scrutinize.
+- **A bug in one capability doesn't burn the others.** If the
+  `fs.read` policy check has a flaw, only filesystem reads are
+  affected. There's no "and now I have RCE" path.
+- **The model can't smuggle.** Prompt injection works against tools
+  that interpret natural language. It doesn't work against an
+  evaluator that has no `import` keyword. The trust boundary is in
+  Rust, not in a system prompt asking the model nicely.
+
+### The two properties combined
+
+Pre-training proximity gives you a model that mostly writes correct
+code on the first try. Addition-based security gives you a runtime
+where "mostly correct" is also "structurally bounded" — even when
+the model writes something the human operator didn't expect, that
+something can only do what the policy file allows.
+
+Both halves are necessary. Pre-training proximity *without*
+addition-based security is just full Python with a fluent agent —
+which is the current state of the art and the reason this project
+exists in the first place. Addition-based security *without*
+pre-training proximity is what Sigil tried, and what the eval
+numbers below say doesn't work at the local-7B scale.
+
+The combination is what's novel, and it's the answer to the question
+"why this language, not some other?" If a future runtime nails this
+combination better — say, capability-typed Wasm with first-class
+LLM support — Aegis becomes obsolete in a week. That's fine. The
+**principle** is what should outlast any specific implementation.
+
 ## What Sigil tried
 
 - **A bespoke language.** Sigil-DSL. Indentation-sensitive but

@@ -123,6 +123,36 @@ prompting:
 Three visibility levels per resource: **forbidden** / **local-only** /
 **public**. Default-deny everywhere; deny wins over allow.
 
+## The design principle
+
+> **Start from a limited language the models already know the syntax of, then extend only with what we need.**
+
+That sentence is the load-bearing decision the rest of Aegis follows
+from. Two properties, both load-bearing on their own:
+
+**"A limited language the models already know"** means we get to
+free-ride on pre-training. Stock LLMs arrive ~90% fluent in Starlark
+on day one because Starlark is Python with three rules removed. The
+remaining gap is closed with prompting + retrieval + retry, not
+months of fine-tuning. (We tried the fine-tuning path in the
+predecessor project, [Sigil](docs/02-from-sigil.md). It plateaued at
+7/30 multi-step tasks. Aegis with stock qwen-7B reaches 27–29/31
+on the same parity benchmark — and 31/31 with Opus on top.)
+
+**"Extend only with what we need"** flips the security model inside
+out. Default Python is *"everything works, lock it down by
+subtraction"*; default Starlark is *"nothing works, opt in by
+addition"*. Every effecting builtin — `fs.read`, `net.http_get`,
+`subprocess.exec`, `env.read` — is a deliberate, named,
+capability-typed addition the runtime can gate. Subtraction-based
+security has a long history of CVE backlogs (every Python sandbox
+that ever shipped). Addition-based security has a much smaller blast
+radius when a corner case is wrong.
+
+Combined: the agent writes code in something it already mostly knows,
+inside a runtime where the only effects are the ones the operator
+explicitly granted.
+
 ## Get started
 
 ```sh
