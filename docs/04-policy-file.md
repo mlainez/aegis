@@ -248,6 +248,30 @@ false-positive cases (the pattern `add` would match `bundle config add`
 even though intent was `bundle add`); use more specific patterns
 (`"add "` with trailing space, or `"add gem-name"`) when needed.
 
+#### Subprocess env is filtered, not inherited
+
+The child process **does not inherit the parent's full environment**.
+Aegis builds the child env from scratch:
+
+- Every name in `[environment].allow_vars` is read from the parent
+  and passed through (if set in the parent).
+- Every name in `[environment].local_only_vars` is **only** passed
+  when the command is in `[subprocess].local_only_commands` — so a
+  local-only command can use a tainted secret for an authenticated
+  call, and the runtime taints its stdout/stderr at the boundary.
+  For a plain (non-local-only) command, the local-only var is NOT
+  passed (otherwise the child could echo it into its output and
+  defeat the redaction).
+- Names in `[environment].deny_vars` are excluded defensively even
+  if they appear in an allow list.
+
+**Practical consequence**: if you want the child to find binaries
+in `$PATH`, list `"PATH"` in `allow_vars`. Same for `"HOME"`,
+`"LANG"`, etc. The `aegis init` templates already include these.
+A policy with empty `allow_vars` produces a fully empty child env;
+the subprocess must use absolute paths and won't have any standard
+shell environment.
+
 ### `[tools]`
 
 For hosts that consult Aegis as a *policy oracle* — they receive a tool

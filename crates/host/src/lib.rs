@@ -511,9 +511,19 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
         }
         let cmd_summary = argv.join(" ");
         ctx.require_confirm("subprocess.exec", format!("exec: {}", cmd_summary))?;
-        let output = std::process::Command::new(&argv[0])
-            .args(&argv[1..])
-            .output();
+        // Build the child env from scratch. The default `Command`
+        // inherits the parent's full env, which would leak vars
+        // beyond what `[environment].allow_vars` permits — that's a
+        // policy bypass for any command that prints / logs / sends
+        // its env. Use env_clear() and pass only what the policy
+        // says the child should see.
+        let mut cmd = std::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        cmd.env_clear();
+        for (name, value) in ctx.policy.subprocess_env(&argv[0]) {
+            cmd.env(name, value);
+        }
+        let output = cmd.output();
         match output {
             Ok(out) => {
                 let ok = out.status.success();

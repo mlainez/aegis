@@ -945,6 +945,45 @@ impl Policy {
         self.net_local_only_hosts.is_match(host)
     }
 
+    /// Compute the (name, value) env pairs to pass to a subprocess
+    /// child for the given `argv0`. The child sees ONLY what this
+    /// returns — the parent's full environment is NOT inherited.
+    ///
+    /// Inclusion rules:
+    /// - Every name in `[environment].allow_vars` (plain reads).
+    /// - Every name in `[environment].local_only_vars`, but **only**
+    ///   when `argv0` is in `[subprocess].local_only_commands`. This
+    ///   lets a local-only subprocess use a tainted secret (e.g. an
+    ///   API key) for an authenticated call; its stdout/stderr will
+    ///   be tainted at the runtime boundary so the value cannot
+    ///   bubble up to the orchestrator.
+    /// - Names in `[environment].deny_vars` are excluded defensively
+    ///   even if they somehow appear in an allow list.
+    ///
+    /// Empty parent-side values are skipped. The caller should
+    /// `env_clear()` before applying these — otherwise the child
+    /// would inherit *both* the filtered set and whatever the
+    /// process default contains, defeating the whole point.
+    pub fn subprocess_env(&self, argv0: &str) -> Vec<(String, String)> {
+        let local_only_command = self.subprocess_is_local_only(argv0);
+        let mut names: Vec<&str> = self.env_allow.iter().map(|s| s.as_str()).collect();
+        if local_only_command {
+            for n in &self.env_local_only {
+                names.push(n.as_str());
+            }
+        }
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            if self.env_deny.iter().any(|d| d == name) {
+                continue;
+            }
+            if let Ok(value) = std::env::var(name) {
+                out.push((name.to_string(), value));
+            }
+        }
+        out
+    }
+
     /// Match argv[0] against the subprocess command policy. Both lists
     /// match against the *basename* of argv[0] (so "/usr/bin/git" and
     /// "git" both match "git"). Deny wins. Empty allowlist means "no
