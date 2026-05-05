@@ -168,6 +168,33 @@ payloads (path, url, argv, env-var name, error message, denial reason)
 go through the same taint redaction as `printed` lines before reaching
 the sink. **The audit log will never contain a tainted value.**
 
+**Tamper-evidence.** Every line written to the file sink is
+SHA-256-chained. Each entry carries `aegis_seq` (monotonic from 1)
+and `aegis_prev_hash` (hex SHA-256 of the previous line, or
+`GENESIS_PREV_HASH = "0".repeat(64)` for the first). On open of an
+existing log, the sink reads the tail to recover the resume point;
+the chain continues across runs. `aegis audit verify <path>`
+replays the chain and reports any line whose hash doesn't match or
+whose seq isn't `prev + 1`, with line numbers and a reason —
+useful as a CI lint or a one-shot integrity check after a run.
+
+**Audit-log protected-path guard.** At policy-load time (when the
+CLI or MCP server is launched with `--audit-log`), the runtime
+refuses to start if the policy grants the agent ANY access (read,
+write, or delete) to the audit-log path. Write/delete would let
+the agent fabricate or erase history; read would let the agent
+compute valid `aegis_prev_hash` values for forged appends. Same
+shape as the policy file's self-writable guard, applied to the
+log.
+
+**What the chain does NOT catch.** Wholesale replacement with a
+fresh, internally-consistent chain (the attacker writes a brand-
+new log starting from seq=1, then replaces the file) is not
+detectable from the chain alone. Defense: forward the log to
+syslog or an immutable sink, OR keep an external reference for
+the expected last seq. Both are operator-side mitigations
+documented in `docs/SECURITY_AUDIT.md`.
+
 ### Confirm hook
 
 The `ConfirmHook` trait lets a host plug in interactive approval for

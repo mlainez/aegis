@@ -256,15 +256,25 @@ operational items (◇) gate easy adoption.
   (Linux only; bubblewrap-backed namespaced bind-mount jail per
   call — paths outside the policy literally don't exist for the
   child, defeats every interpreter-side path-obfuscation trick)
+- ✅ Symlink canonicalization in `fs.*` (a symlink at
+  `<root>/src/x → /etc/passwd` no longer slips past the policy
+  check)
+- ✅ HTTP redirects no longer auto-followed (`net.http_*` returns a
+  typed error on 3xx so the script must reissue against the new
+  URL — gate fires)
+- ✅ Taint-redaction now covers the error path (`fail(secret)`
+  no longer leaks via `AegisError::Display`)
+- ✅ SHA-256-chained audit log + `aegis audit verify <path>`
+  subcommand (in-place mutation, line removal, seq jumps all
+  detectable)
+- ✅ Audit-log protected-path guard (the agent cannot have
+  read/write/delete on the audit log — same shape as the
+  self-writable guard for the policy file)
 
 ### Still open
 
 #### Security gates (block daily-driver use)
 
-- ☐ **Tamper-evident audit log.** Today the JSONL log is plain text.
-  An agent allowed to write to the log's path could rewrite history.
-  Need at minimum HMAC-chained entries with a key the agent can't
-  reach.
 - ☐ **Fuzz the verifier and the TOML/policy parser.** A week of
   `cargo-fuzz` against the verifier's comment/string-stripping, the
   globset path matchers, and the TOML deserializer. Fix what falls

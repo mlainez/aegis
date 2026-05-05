@@ -104,7 +104,15 @@ until you launch with --policy <project.toml>. See examples/policies/ for templa
         }
     };
     let audit: Arc<dyn AuditSink> = match &cli.audit_log {
-        Some(path) => Arc::new(JsonlAuditSink::file(path)?),
+        Some(path) => {
+            // Refuse to start if the audit log path is reachable
+            // to the agent. See guard_audit_log doc.
+            let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            policy.guard_audit_log(&canon).map_err(|e| {
+                anyhow::anyhow!("audit-log path is reachable to the agent: {e}")
+            })?;
+            Arc::new(JsonlAuditSink::file(path)?)
+        }
         None => Arc::new(JsonlAuditSink::stderr()),
     };
     // The confirm-mode flag chooses between auto-allow (default,

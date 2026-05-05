@@ -47,6 +47,31 @@ enum Command {
     Init(InitArgs),
     /// Inspect or validate a policy file.
     Policy(PolicyCli),
+    /// Inspect or verify the audit log.
+    Audit(AuditCli),
+}
+
+#[derive(Parser, Debug)]
+struct AuditCli {
+    #[command(subcommand)]
+    command: AuditCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum AuditCommand {
+    /// Walk a JSONL audit log and verify the SHA-256 chain. Each
+    /// entry's `aegis_prev_hash` is checked against the SHA-256 of
+    /// the previous line, and `aegis_seq` is checked for monotonic
+    /// +1 progression. Reports per-line failures with the kind of
+    /// mismatch. Exits 0 if the chain is intact, non-zero
+    /// otherwise.
+    Verify(AuditTargetArgs),
+}
+
+#[derive(Parser, Debug)]
+struct AuditTargetArgs {
+    /// Path to the JSONL audit log to verify.
+    log: PathBuf,
 }
 
 #[derive(Parser, Debug)]
@@ -157,7 +182,38 @@ fn dispatch() -> Result<(), CliError> {
             PolicyCommand::Validate(a) => policy_validate(a),
             PolicyCommand::Show(a) => policy_show(a),
         },
+        Command::Audit(a) => match a.command {
+            AuditCommand::Verify(args) => audit_verify(args),
+        },
     }
+}
+
+fn audit_verify(args: AuditTargetArgs) -> Result<(), CliError> {
+    let report = aegis_host::verify_chain(&args.log).map_err(CliError::Io)?;
+    if report.ok() {
+        println!(
+            "OK: {} entries, chain valid (last seq = {}).",
+            report.total_lines, report.last_seq
+        );
+        return Ok(());
+    }
+    eprintln!(
+        "audit: chain BROKEN — {} failure(s) across {} entries",
+        report.failures.len(),
+        report.total_lines
+    );
+    for f in &report.failures {
+        let seq = f
+            .seq
+            .map(|s| format!("seq={s}"))
+            .unwrap_or_else(|| "seq=?".to_string());
+        eprintln!("  line {} ({}): {}", f.line_number, seq, f.reason);
+    }
+    Err(CliError::Other(format!(
+        "audit log {:?} failed verification ({} failures)",
+        args.log,
+        report.failures.len()
+    )))
 }
 
 fn policy_validate(args: PolicyTargetArgs) -> Result<(), CliError> {
@@ -327,7 +383,18 @@ fn run(args: RunArgs) -> Result<(), CliError> {
         });
 
     let audit: Arc<dyn AuditSink> = match &args.audit_log {
-        Some(path) => Arc::new(JsonlAuditSink::file(path)?),
+        Some(path) => {
+            // Refuse to start if the audit log path is reachable to
+            // the agent — write/delete would let it fabricate or
+            // erase history; read would let it compute valid
+            // hash-chain prev_hash values for forged appends. The
+            // self-writable guard's audit-log sibling.
+            let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            policy
+                .guard_audit_log(&canon)
+                .map_err(|e| CliError::Other(format!("audit-log path is reachable to the agent: {e}")))?;
+            Arc::new(JsonlAuditSink::file(path)?)
+        }
         None => Arc::new(JsonlAuditSink::stderr()),
     };
     let confirm: Arc<dyn ConfirmHook> = if args.yes {

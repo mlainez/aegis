@@ -66,7 +66,10 @@ fn finalize_http_response(resp: ureq::Response) -> anyhow::Result<String> {
     Ok(resp.into_string()?)
 }
 
-pub use audit::{AuditEvent, AuditSink, JsonlAuditSink, NullAuditSink};
+pub use audit::{
+    verify_chain, AuditEvent, AuditSink, JsonlAuditSink, NullAuditSink, VerifyFailure,
+    VerifyReport, GENESIS_PREV_HASH,
+};
 pub use confirm::{AllowAllConfirm, ConfirmDecision, ConfirmHook, ConfirmRequest, DenyAllConfirm};
 pub use taint::{redact, TaintRegistry, REDACTED};
 
