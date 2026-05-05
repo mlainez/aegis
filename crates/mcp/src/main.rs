@@ -16,6 +16,12 @@
 //! - `aegis_subprocess_exec(argv)` — same.
 //! - `aegis_net_http_get(url)`, `aegis_net_http_post(url, body)` — same.
 //! - `aegis_env_read(name)` — same.
+//! - `aegis_tool_routing(name?)` — read-only oracle. Returns the
+//!   `[tools.X]` routing hints (capabilities, backend_url,
+//!   backend_method, description, allowed flag) for a named tool,
+//!   or all declared tools if no name is given. Lets a calling host
+//!   like Claude Code consult the policy's tool surface without
+//!   re-parsing the TOML itself.
 //!
 //! Each tool call goes through the same enforcement path the CLI uses:
 //! pre-execution verifier, policy checks at every capability builtin,
@@ -236,6 +242,13 @@ fn handle_tools_call(runner: &Runner, counter: &mut u64, id: Value, params: Valu
     *counter += 1;
     let task_id = format!("mcp-{counter}");
 
+    // `aegis_tool_routing` is a read-only oracle that consults the
+    // policy without invoking the runner. It does not allocate a
+    // task ID, audit, or evaluate Starlark.
+    if name == "aegis_tool_routing" {
+        return handle_tool_routing(runner, id, &args);
+    }
+
     let script_result = match dispatch(&name, &args, &task_id) {
         Ok(s) => s,
         Err(msg) => {
@@ -281,6 +294,59 @@ fn tool_error_response(id: Value, err: &AegisError) -> Response {
             ],
             "isError": true,
             "aegis_error_kind": kind,
+        }),
+    )
+}
+
+/// Handle the `aegis_tool_routing` MCP tool. Read-only: consults the
+/// policy and returns either one named record or all of them, with an
+/// `allowed` flag computed from the same `Policy::check_tool` path
+/// the runner uses. No script is evaluated, no audit event written.
+fn handle_tool_routing(runner: &Runner, id: Value, args: &Value) -> Response {
+    let policy = runner.policy();
+    let name = args.get("name").and_then(|v| v.as_str());
+
+    fn record_to_json(
+        policy: &aegis_policy::Policy,
+        name: &str,
+        record: &aegis_policy::ToolRecord,
+    ) -> Value {
+        let allowed = policy.check_tool(name).is_ok();
+        json!({
+            "name": name,
+            "allowed": allowed,
+            "capabilities": record.capabilities,
+            "backend_url": record.backend_url,
+            "backend_method": record.method(),
+            "description": record.description,
+        })
+    }
+
+    let body = match name {
+        Some(n) => match policy.tool_routing(n) {
+            Some(record) => json!({ "tool": record_to_json(policy, n, record) }),
+            None => json!({
+                "tool": null,
+                "error": format!("tool {n:?} not declared in [tools]"),
+            }),
+        },
+        None => {
+            let tools: Vec<Value> = policy
+                .tools_iter()
+                .map(|(n, r)| record_to_json(policy, n, r))
+                .collect();
+            json!({ "tools": tools })
+        }
+    };
+
+    Response::ok(
+        id,
+        json!({
+            "content": [
+                { "type": "text", "text": serde_json::to_string(&body).unwrap_or_default() }
+            ],
+            "isError": false,
+            "structuredContent": body,
         }),
     )
 }
@@ -494,6 +560,19 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": { "name": { "type": "string" } },
                 "required": ["name"]
+            }
+        },
+        {
+            "name": "aegis_tool_routing",
+            "description": "Read-only policy oracle. Returns the [tools.X] routing record for a given external tool name (e.g. WebSearch, Bash, Read), or every declared tool if no name is provided. The record contains: capabilities (Aegis caps the tool requires), backend_url and backend_method (where the policy expects the call to land), description, and an allowed flag (true iff every required capability is permitted). Bridges and hosts use this to surface the policy's tool surface to a calling agent without re-parsing the TOML.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Optional tool name. Omit to receive every declared [tools.X] record."
+                    }
+                }
             }
         }
     ])

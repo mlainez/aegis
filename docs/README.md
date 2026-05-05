@@ -48,6 +48,12 @@ host (Claude Code, opencode, Cursor, custom orchestrators) can wire in.
 - [AGENT_POLICY_SPEC.md](AGENT_POLICY_SPEC.md) — the portable spec.
   Tool-agnostic; consumable by any agentic system. Use this if you're
   implementing the policy format in a non-Aegis runtime.
+- [SECURITY_THREAT_MODEL.md](SECURITY_THREAT_MODEL.md) — one-page
+  review companion. What Aegis defends against, what it explicitly
+  does *not* defend against, and where the trust boundaries sit.
+  Read first if you're auditing with hostile intent.
+- [SECURITY_AUDIT.md](SECURITY_AUDIT.md) — the 16-surface
+  bypass-assessment writeup that triggered the recent security work.
 - [CONCLUSIONS.md](CONCLUSIONS.md) — the Sigil retrospective notes
   Aegis was built from. Background reading for `02-from-sigil.md`.
 - [PROJECT_PLAN.md](PROJECT_PLAN.md) — initial design plan, kept as a

@@ -918,6 +918,14 @@ impl Policy {
         self.tools.get(name)
     }
 
+    /// Iterate every declared `[tools.X]` entry by `(name, record)`.
+    /// Bridges and MCP servers use this to surface the policy's
+    /// declared toolset (with routing hints) to a calling host so the
+    /// host doesn't have to re-parse the TOML itself.
+    pub fn tools_iter(&self) -> impl Iterator<Item = (&str, &ToolRecord)> {
+        self.tools.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
     /// Whether the named capability is permitted by the policy. A
     /// capability is permitted exactly when the corresponding resource
     /// section is populated — `read_allow` or `local_only_read` for

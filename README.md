@@ -288,6 +288,21 @@ operational items (◇) gate easy adoption.
 - ✅ Audit-log protected-path guard (the agent cannot have
   read/write/delete on the audit log — same shape as the
   self-writable guard for the policy file)
+- ✅ One-page security threat-model doc
+  ([docs/SECURITY_THREAT_MODEL.md](docs/SECURITY_THREAT_MODEL.md))
+  — what Aegis defends against, what it does *not*, the trust
+  boundaries, the assumptions
+- ✅ Adversarial exfiltration probe
+  ([examples/local_executor/run_exfil.py](examples/local_executor/run_exfil.py))
+  — 12 hand-written Starlark exfil techniques against
+  `local_only_vars`. Current run: **6 LEAK / 3 WEAK_LEAK / 3
+  REDACTED**. Confirms substring redaction is *not* a
+  sufficient defence against a deliberate adversary; the gap
+  is documented honestly in the threat-model doc.
+- ✅ `aegis-mcp` surfaces `[tools.X]` routing hints
+  (`aegis_tool_routing` MCP tool) so Claude Code calling
+  `aegis_run` directly can read `backend_url` / capabilities /
+  allowed flag without re-parsing the policy TOML
 
 ### Still open
 
@@ -301,35 +316,30 @@ operational items (◇) gate easy adoption.
   unaudited security code. The policy crate, the verifier, and the
   taint-redaction code in `crates/host/src/taint.rs` need a human
   security engineer reading them with hostile intent. **This is the
-  single biggest gating item.**
-- ☐ **Adversarial exfiltration probe in the eval harness.** An agent
-  that *deliberately tries* to leak a `local_only_var` via
-  XOR/base64/chunking — see what bypasses the substring redaction.
-  Will probably find a real path; that finding directly informs
-  whether the local-only feature is shippable as advertised or
-  needs real information-flow tracking.
+  single biggest gating item.** The threat-model doc and the exfil
+  probe's findings are bundled to give the reviewer a clear scope.
+- ☐ **Real information-flow tracking for `local_only_*`.** The
+  exfil probe found 6 substring-redaction bypasses (encode,
+  reverse, hex, XOR, fs.write to disk, error-path with mutation).
+  Closing this requires either real IFC at the runtime layer, or
+  scoping `local_only_*` more tightly (e.g. block any operation
+  whose argument was tainted, not just substring-scrub on output).
+  Decide which.
 
 #### Operational gates (block easy adoption)
 
 - ◇ **Published binaries.** `cargo install`, Homebrew tap, or
   pre-built tarballs. Build-from-source is fine for evaluation, not
   for "ship to three machines and standardize."
-- ◇ **`aegis-mcp` consuming `[tools.X]` routing hints.** The Rust
-  schema and the local-executor bridge (`local_mcp.py`) both speak
-  it; `aegis-mcp` itself doesn't yet surface routing back to MCP
-  clients. Means Claude Code calling `aegis_run` directly gets no
-  benefit from `backend_url` today.
 - ◇ **Policy schema migration tool.** When the schema changes
   pre-1.0, existing policies are hand-edited. An `aegis policy
   migrate` would smooth this.
-- ◇ **One-page security threat-model doc.** Gathers the assumptions
-  and limitations from across the docs into one place a security
-  reviewer can sit down with.
 
 For today: use Aegis for experimental setups, in containers, on
 machines where the cost of an Aegis bug is "I have to recover a VM"
 not "my SSH key got exfiltrated." For default-on-everything use,
-the four ☐ items above are the real gating list.
+the three ☐ items above (fuzzing, external review, IFC for
+local-only) are the real gating list.
 
 ## Project layout
 
