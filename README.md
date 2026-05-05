@@ -136,8 +136,14 @@ on day one because Starlark is Python with three rules removed. The
 remaining gap is closed with prompting + retrieval + retry, not
 months of fine-tuning. (We tried the fine-tuning path in the
 predecessor project, [Sigil](docs/02-from-sigil.md). It plateaued at
-7/30 multi-step tasks. Aegis with stock qwen-7B reaches 27–29/31
-on the same parity benchmark — and 31/31 with Opus on top.)
+7/30 multi-step tasks. Aegis with **stock qwen-7B alone** (no cloud
+orchestrator) reaches 36/36 on the current 36-task suite. Layered
+with Sonnet/Opus orchestration on top of qwen+Aegis on the same
+36-task suite: Sonnet 30/36, Opus 28/36 — the orchestrated failures
+are model-side artifacts (Sonnet preemptively refuses some DENY
+tasks; Opus burns turns through a GitHub API rate-limit), not
+runtime-side. See [docs/09-local-executor.md](docs/09-local-executor.md)
+for the per-failure breakdown.)
 
 **"Extend only with what we need"** flips the security model inside
 out. Default Python is *"everything works, lock it down by
@@ -221,11 +227,15 @@ determines which arrows it stops.
 ## Status
 
 Pre-1.0. The runtime is solid; the eval harness reproduces stable
-numbers (qwen 7B alone: 36/36 on the current 36-task suite, which
+numbers (qwen 7B alone: **36/36** on the current 36-task suite, which
 includes 5 feature-demo tasks pinning specific runtime layers;
-Sonnet-orchestrated: 28/31 on the original 31-task subset;
-Opus-orchestrated: 31/31). The policy spec is portable and
-documented. APIs may still change.
+Sonnet-orchestrated on the same suite: **30/36 / $1.37**;
+Opus-orchestrated: **28/36 / $4.09**). The orchestrated gap is
+model-side, not runtime-side — Aegis denies/redacts correctly in
+every case; the orchestrators sometimes refuse tasks they should
+attempt or get rate-limited by GitHub mid-run. Per-failure
+breakdown in [docs/09-local-executor.md](docs/09-local-executor.md).
+The policy spec is portable and documented. APIs may still change.
 
 ## Roadmap to production-readiness
 

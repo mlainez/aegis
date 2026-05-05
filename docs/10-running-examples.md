@@ -139,18 +139,39 @@ through `aegis-mcp` under your project policy.
 python3 examples/local_executor/run_orchestrated.py --models sonnet opus --all
 ```
 
-Expected (full 31-task suite, two orchestrators):
+Expected (full 36-task suite, two orchestrators):
 
 | Orchestrator | Passed | Total cost | Avg turns/task |
 |--------------|-------:|-----------:|---------------:|
-| sonnet       | 28/31  | $1.16      | 2.3            |
-| opus         | 31/31  | $2.24      | 2.2            |
+| sonnet       | 30/36  | $1.37      | 2.3            |
+| opus         | 28/36  | $4.09      | 3.4            |
 
 Each delegated step is a separate API call. Cost depends on the
 model and per-task budget (default `--max-budget-usd 1.00`).
 
+The orchestrated scores trail the qwen-alone 36/36 because of
+*orchestrator-side* artifacts, not runtime-side regressions:
+
+- **Sonnet preemptive refusal on some DENY tasks** (~4 fails). The
+  cloud model recognises a task as "obviously unsafe" and refuses
+  to delegate it, so the runtime never gets to demonstrate the
+  policy gate firing. The DENY tasks are designed to *prove the
+  gate works* — a refusal at the orchestrator layer is a different
+  (also-fine) outcome the verify hook doesn't credit.
+- **Verify-hook substring strictness on LOCAL_ONLY tasks** (~2
+  fails). The redaction in the runtime correctly replaces the
+  secret with `[REDACTED]`; the orchestrator then paraphrases the
+  step output and the literal substring `[REDACTED]` doesn't
+  always survive verbatim.
+- **`api.github.com` rate-limit during the longer Opus leg** (~6
+  fails). Unauthenticated GitHub API is 60 req/hour; Opus uses
+  more turns/task, so the back half of the run hits 403s.
+
+None of these are runtime-side bugs. The runtime denies and redacts
+correctly in every case where it's invoked.
+
 Flags:
-- `--all` — run every task in `TASKS` (full 31-task suite, the
+- `--all` — run every task in `TASKS` (full 36-task suite, the
   numbers above)
 - `--models sonnet opus` — which orchestrators to compare
 - `--max-budget-usd <N>` — per-task budget cap
@@ -213,8 +234,8 @@ default run.
 | Headline | How to reproduce |
 |----------|------------------|
 | qwen-7B 36/36 (fresh URLs) | `python3 examples/local_executor/run_multistep.py` |
-| Sonnet 28/31 / $1.16 | `python3 examples/local_executor/run_orchestrated.py --models sonnet --all` |
-| Opus 31/31 / $2.24 | `python3 examples/local_executor/run_orchestrated.py --models opus --all` |
+| Sonnet 30/36 / $1.37 | `python3 examples/local_executor/run_orchestrated.py --models sonnet --all` |
+| Opus 28/36 / $4.09 | `python3 examples/local_executor/run_orchestrated.py --models opus --all` |
 | Single-step 10/10 | `python3 examples/local_executor/run.py` |
 
 Each number is the result of a single run — they're stable to

@@ -212,9 +212,9 @@ runtime stays spec-compliant Starlark.
 
 This stance is *load-bearing across the project*. It's why local-executor
 evaluation works at all (see [09-local-executor.md](09-local-executor.md)):
-a 7B model + 4 retrieved worked examples + one retry on Starlark errors
-gets 27-29 of 31 multi-step tasks correct, *without ever relaxing the
-runtime*.
+a 7B model **alone** (no cloud orchestrator) plus 4 retrieved worked
+examples plus one retry on Starlark errors gets the entire current
+36-task multi-step suite correct, *without ever relaxing the runtime*.
 
 ### 3. Policy as portable data
 
@@ -234,10 +234,24 @@ choices in Aegis:
 
 - **Stream C ceiling at parity:** Sigil's local-7B Stream C topped out at
   **7/30 multi-step tasks** despite extensive tuning effort.
-- **Aegis with a stock 7B (`qwen2.5-coder:7b`):** **10/10 single-step**,
-  **27-29/31 multi-step** with embedding-RAG + 1-retry validator-in-loop.
-- **Aegis with cloud orchestrator on top:** Sonnet **28/31 / $1.16**, Opus
-  **31/31 / $2.24** on the same 31-task suite.
+- **Aegis with a stock 7B (`qwen2.5-coder:7b`) alone, no cloud:**
+  **10/10 single-step**, **36/36 multi-step** on the current expanded
+  suite with embedding-RAG + 1-retry validator-in-loop. (The earlier
+  27-29/31 figure quoted in older docs reflects the original 31-task
+  version of the suite before some hardcoded URLs were refreshed and
+  the redirect-blocking fix landed.)
+- **Aegis with cloud orchestrator layered on top of qwen+Aegis (same
+  36-task suite):** Sonnet **30/36 / $1.37**, Opus **28/36 / $4.09**.
+  In this mode the cloud model only does task decomposition and step
+  routing; qwen still writes every Starlark program. The orchestrated
+  scores trail qwen-alone because of orchestrator-side artifacts, not
+  runtime-side regressions: Sonnet preemptively refuses some DENY tasks
+  it should *attempt* (so the runtime never gets to demonstrate the
+  gate firing), and Opus burns turns through a `api.github.com`
+  rate-limit during the longer run. The runtime denies correctly and
+  redacts correctly in every case where it's invoked. See
+  [09-local-executor.md](09-local-executor.md) for the per-failure
+  breakdown.
 
 The pre-training-proximity intuition — that pulling the language toward
 what stock models already know is more effective than pulling models

@@ -208,7 +208,7 @@ write files, run shells, or fetch URLs — every side effect has to flow
 through the local model and Aegis.
 
 The `examples/local_executor/run_orchestrated.py` harness automates this
-pattern across a 31-task evaluation suite, so you can reproduce the
+pattern across a 36-task evaluation suite, so you can reproduce the
 project's measurement runs with `python3 run_orchestrated.py --models
 sonnet opus --all`.
 

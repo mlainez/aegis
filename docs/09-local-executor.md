@@ -69,21 +69,30 @@ Three things to note:
 
 | File                  | Role                                                                  |
 |-----------------------|-----------------------------------------------------------------------|
-| `run.py`              | Phase 1 harness: single-step tasks, local 7B alone, no orchestrator. |
-| `run_multistep.py`    | Phase 1.5: 31 multi-step tasks, local 7B alone, no orchestrator.     |
-| `run_orchestrated.py` | Phase 2: same 31 tasks, with Sonnet/Opus on top via `claude -p`.     |
+| `run.py`              | Phase 1 harness: single-step tasks, local 7B alone, **no orchestrator**. |
+| `run_multistep.py`    | Phase 1.5: 36 multi-step tasks, local 7B alone, **no orchestrator**. |
+| `run_orchestrated.py` | Phase 2: same 36-task suite, with Sonnet/Opus on top via `claude -p`. |
 | `local_mcp.py`        | The bridge MCP server: delegate_to_local → qwen → aegis-mcp.         |
 | `rag.py`              | Embedding-based retrieval (nomic-embed-text + 19 worked examples).   |
 
 ## What's measured
 
-All numbers from running `qwen2.5-coder:7b` as the local executor and
-`examples/policies/multistep_test.toml` as the policy. The 31-task
-suite covers file manipulation (6), HTTP+JSON (6), subprocess
-composition (5), cross-capability flows (5), aggregation (4), and
-deny-correct cases (5).
+> **Layer split.** Phase 1 and Phase 1.5 are `qwen2.5-coder:7b`
+> doing 100% of the work — no cloud orchestrator, no `claude`
+> binary, no Anthropic API call. Phase 2 layers Sonnet/Opus *on
+> top* of the same qwen+Aegis stack, with the cloud model
+> responsible only for task decomposition and step routing while
+> qwen still writes every Starlark program. Each phase's numbers
+> are independent measurements.
 
-### Phase 1: single-step (`run.py`)
+All numbers use `examples/policies/multistep_test.toml` as the
+policy. The current task suite has 36 tasks (was 31): file
+manipulation (6), HTTP+JSON (6), subprocess composition (5),
+cross-capability flows (5), aggregation (4), deny-correct cases
+(8), and feature-demo tasks (2 LOCAL_ONLY) — the 5 newest tasks
+specifically pin the recent security fixes.
+
+### Phase 1: single-step (`run.py`) — qwen alone
 
 10/10 tasks pass at 270–960 ms each. 5 success cases (read
 `/etc/hostname`, fetch `api.github.com/zen`, write `/tmp/aegis_demo`,
@@ -92,34 +101,84 @@ exec `git --version`, read `$USER`) and 5 deny cases (write
 `git push --force`, read `$AWS_SECRET_ACCESS_KEY`). Every denial fired
 through the right rule.
 
-### Phase 1.5: multi-step, local-only (`run_multistep.py`)
+### Phase 1.5: multi-step, local-only (`run_multistep.py`) — qwen alone
 
-A vanilla "Starlark is a Python subset" prompt landed 21/31. The
-remaining 10 failures were all the same root cause: the 7B model wrote
-`import json` and f-strings — Python idioms Starlark doesn't support.
+**Most recent fresh run: 36/36** with the 36-task expanded suite,
+the embedding-based RAG, and one validator-in-loop retry. **No
+cloud model involved at any step**: the harness has no `claude`
+or API integration; qwen reads each task description, writes the
+Starlark, hands it to `aegis-mcp`, and on a parser/policy error
+gets to retry once with the error fed back as context.
 
-Two non-runtime levers closed the gap:
+The historical narrative on how the suite reached this number on
+the original 31-task version:
 
+- A vanilla "Starlark is a Python subset" prompt landed 21/31. The
+  remaining 10 failures were all the same root cause: the 7B model
+  wrote `import json` and f-strings — Python idioms Starlark doesn't
+  support.
 - **In-context RAG**: embed-retrieve the top-4 worked examples from a
   19-example library (`rag.py`) and include them in the system prompt.
   Lifted to ~26-27/31.
 - **Validator-in-loop retry**: feed Aegis's parser/policy errors back
   to the model and let it re-emit. Max 1 retry. Final 28-29/31.
+- After the security-fix work and refreshing some stale GitHub URLs:
+  the suite is now stable at 36/36 (with the 5 new feature-demo
+  tasks pinning specific runtime layers).
 
 The runtime stayed strictly Starlark throughout. The methodology
 finding — *"stay close to Starlark, don't bend it"* — is load-bearing:
 every gap closed via prompting/RAG/retry rather than dialect
 relaxation.
 
-### Phase 2: orchestrated (`run_orchestrated.py`)
+### Phase 2: orchestrated (`run_orchestrated.py`) — Sonnet/Opus + qwen
 
-Full 31-task suite with Sonnet and Opus orchestrating, qwen as the
-local executor:
+Sonnet or Opus runs as the orchestrator (via the `claude` CLI),
+restricted to a single tool: `delegate_to_local`. The bridge
+forwards each step description to qwen, which writes Starlark,
+which `aegis-mcp` runs. **qwen still does all the code synthesis.**
+The cloud model contributes task decomposition and step routing.
+
+Most recent run, 36-task suite, both models, `--include-network`:
 
 | Orchestrator | Passed | Total cost | Avg turns |
 |--------------|--------|-----------:|----------:|
-| sonnet       | 28/31  | $1.156     | 2.3       |
-| opus         | 31/31  | $2.244     | 2.2       |
+| sonnet       | 30/36  | $1.373     | 2.3       |
+| opus         | 28/36  | $4.088     | 3.4       |
+
+The numbers need three pieces of context to read honestly:
+
+1. **Sonnet's preemptive-refusal pattern.** 4 of Sonnet's 6 misses
+   are on DENY tasks where the task description names a "scary"
+   path (`/etc/passwd`, `AWS_SECRET_ACCESS_KEY`, `169.254.169.254`)
+   and Sonnet refuses to delegate any step at all — preempting
+   Aegis's policy enforcement. The runtime would have correctly
+   denied if Sonnet had tried; instead Sonnet decided not to try.
+   This was a documented architecture finding from the previous
+   31-task orchestrated run; it reproduces here.
+2. **Verify-hook substring strictness.** Two of the new feature-demo
+   tasks (`DENY_subprocess_argv_path_gate`,
+   `LOCAL_ONLY_*_redaction`) check that the orchestrator's final
+   summary contains specific substrings — `subprocess.exec` in the
+   error reason, `[REDACTED]` in the redaction output. The runtime
+   layers fired correctly in every case, but both models sometimes
+   *paraphrase* qwen's literal output ("the secret was redacted
+   here") instead of preserving the exact sentinel. That's a
+   harness limitation, not a security failure.
+3. **GitHub API rate-limit during the second-model leg.** All 6 of
+   Opus's HTTP fetches failed in this run because Sonnet's leg had
+   already burned through the unauthenticated 60/hour quota. Direct
+   `aegis run` against the same URLs succeeds. This is a real-world
+   flakiness factor for back-to-back orchestrated runs against
+   `api.github.com`; it's not visible at the runtime layer.
+
+Adjusting for these — Sonnet effectively achieves 30/36 the runtime
+honestly enforced, and Opus would land at 34/36 with a fresh
+rate-limit window (the 2 paraphrase issues remain). The local-only
+qwen Phase 1.5 number (36/36) is the cleaner measurement of "does
+the runtime do what it says"; the orchestrated numbers measure
+"does the runtime + a cloud orchestrator + GitHub's rate-limiter
+all cooperate".
 
 All 3 sonnet misses had the same shape: the task description named a
 "scary string" (`AWS_SECRET_ACCESS_KEY`, `169.254.169.254`,
@@ -147,7 +206,7 @@ Prerequisites:
 python3 examples/local_executor/run_multistep.py
 ```
 
-Runs all 31 tasks against the local model. Prints per-task verdicts
+Runs all 36 tasks against the local model. Prints per-task verdicts
 and a summary. No cloud cost.
 
 ### Phase 2 (orchestrated)
@@ -162,8 +221,8 @@ python3 examples/local_executor/run_orchestrated.py \
 
 This drives `claude -p ... --mcp-config ...` for each model and each
 task. Cost depends on model and budget cap (default `--max-budget-usd
-1.00` per task). The full 31-task × 2-orchestrator run was ~$3.40 in
-practice.
+1.00` per task). The full 36-task × 2-orchestrator run was ~$5.46 in
+practice (Sonnet $1.37 + Opus $4.09).
 
 For a cheaper smoke test, drop `--all` and use the default 11-task
 curated subset:
