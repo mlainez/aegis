@@ -55,6 +55,8 @@ pub enum PolicyError {
         policy_path: PathBuf,
         action: &'static str,
     },
+    #[error("runtime cap exceeded: {kind} ({detail})")]
+    RuntimeLimit { kind: &'static str, detail: String },
 }
 
 /// Top-level policy. Loaded from a TOML file. The `source_path` is
@@ -90,6 +92,10 @@ pub struct PolicyFile {
     pub environment: EnvironmentPolicy,
     #[serde(default)]
     pub subprocess: SubprocessPolicy,
+    /// Resource caps applied to the Starlark evaluator itself, not
+    /// to any specific capability. Optional; absent ⇒ unlimited.
+    #[serde(default)]
+    pub runtime: RuntimePolicy,
     /// Map from external tool names (as exposed by an MCP host or an
     /// IDE agent runtime) to the dotted Aegis capability names the
     /// tool requires. A consuming host that receives a tool call (e.g.
@@ -167,6 +173,29 @@ pub struct NetworkPolicy {
 // implies `fs.read` is permitted, populating
 // `[subprocess].allow_commands` implies `subprocess.exec`, and so on.
 // See `derive_capabilities` below.
+
+/// Resource caps that apply to the Starlark evaluator itself.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct RuntimePolicy {
+    /// Wall-time cap, in seconds. Checked at every effecting
+    /// capability call (`fs.read`, `net.http_*`, `subprocess.exec`,
+    /// `env.read`); a call past the deadline returns a
+    /// `RuntimeLimit` error before the action runs. Pure
+    /// computation (loops with no I/O) is NOT caught by this — it
+    /// runs inside Starlark's evaluator and there is no public
+    /// per-statement abort hook. Run inside a container if you
+    /// need total isolation.
+    ///
+    /// `None` (default) ⇒ no time limit.
+    #[serde(default)]
+    pub max_seconds: Option<u64>,
+    /// Maximum Starlark call-stack depth. Defends against recursion
+    /// bombs. Forwarded to `Evaluator::set_max_callstack_size`.
+    /// `None` (default) ⇒ Starlark's built-in default
+    /// (typically a few hundred).
+    #[serde(default)]
+    pub max_callstack_size: Option<usize>,
+}
 
 /// Full record for a `[tools.X]` entry: the capabilities it requires
 /// plus optional routing hints (where the tool's outbound call should
@@ -503,6 +532,18 @@ fn merge_policy_files(base: PolicyFile, over: PolicyFile) -> PolicyFile {
                 over.subprocess.local_only_commands,
             ),
             deny_args: merge_deny_args(base.subprocess.deny_args, over.subprocess.deny_args),
+        },
+        runtime: RuntimePolicy {
+            // Scalar overlay: user-file value wins when set, else
+            // base preset wins. A user that wants to remove an
+            // inherited cap must set the field explicitly to 0
+            // (interpreted as no-limit if needed) or null — but
+            // `Option<u64>` already gives that knob via absence.
+            max_seconds: over.runtime.max_seconds.or(base.runtime.max_seconds),
+            max_callstack_size: over
+                .runtime
+                .max_callstack_size
+                .or(base.runtime.max_callstack_size),
         },
         tools: merge_tools(base.tools, over.tools),
         confirm_per_call: concat_dedup(base.confirm_per_call, over.confirm_per_call),
@@ -943,6 +984,17 @@ impl Policy {
     /// at output boundaries.
     pub fn host_is_local_only(&self, host: &str) -> bool {
         self.net_local_only_hosts.is_match(host)
+    }
+
+    /// Wall-time deadline cap, in seconds, for the script's
+    /// effecting capability calls. `None` ⇒ no limit.
+    pub fn runtime_max_seconds(&self) -> Option<u64> {
+        self.file.runtime.max_seconds
+    }
+
+    /// Max Starlark call-stack depth. `None` ⇒ Starlark's default.
+    pub fn runtime_max_callstack_size(&self) -> Option<usize> {
+        self.file.runtime.max_callstack_size
     }
 
     /// Compute the (name, value) env pairs to pass to a subprocess

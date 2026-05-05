@@ -97,6 +97,8 @@ pub enum AegisError {
     Verifier(String),
     #[error("confirm hook denied capability {0}")]
     ConfirmDenied(String),
+    #[error("runtime cap exceeded: {0}")]
+    RuntimeLimit(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("{0}")]
@@ -109,6 +111,9 @@ impl From<PolicyError> for AegisError {
     }
 }
 
+/// CapturedKind extended with `RuntimeLimit` so a deadline-exceeded
+/// signal raised inside a builtin can be surfaced as the right
+/// AegisError variant (and exit code) past Starlark's wrapping.
 /// Captured error stashed on HostCtx so Runner::run can recover the
 /// original error kind after Starlark wraps everything in its own type.
 #[derive(Clone, Debug)]
@@ -121,6 +126,7 @@ struct CapturedError {
 enum CapturedKind {
     Policy,
     ConfirmDenied,
+    RuntimeLimit,
 }
 
 /// Outcome of running a script.
@@ -179,6 +185,7 @@ impl Runner {
             printed: RefCell::new(Vec::new()),
             captured: RefCell::new(None),
             taint: TaintRegistry::default(),
+            start_time: std::time::Instant::now(),
         };
 
         let globals = GlobalsBuilder::extended_by(&[
@@ -198,6 +205,11 @@ impl Runner {
             let mut eval = Evaluator::new(&module);
             eval.set_print_handler(&print_handler);
             eval.extra = Some(&ctx);
+            // Apply optional runtime caps from the policy.
+            if let Some(stack) = ctx.policy.runtime_max_callstack_size() {
+                eval.set_max_callstack_size(stack)
+                    .map_err(|e| AegisError::Other(format!("set_max_callstack_size: {e}")))?;
+            }
             eval.eval_module(prelude_ast, &globals)
                 .map_err(|e| format!("aegis prelude failed: {e}"))
                 .and_then(|_| {
@@ -222,6 +234,7 @@ impl Runner {
                 Some(c) => match c.kind {
                     CapturedKind::Policy => AegisError::Policy(c.message),
                     CapturedKind::ConfirmDenied => AegisError::ConfirmDenied(c.message),
+                    CapturedKind::RuntimeLimit => AegisError::RuntimeLimit(c.message),
                 },
                 None => AegisError::Starlark(starlark_msg),
             });
@@ -246,13 +259,52 @@ struct HostCtx {
     /// payloads, MCP tool result text) is scrubbed against this
     /// registry before leaving.
     taint: TaintRegistry,
+    /// Wall-clock instant when evaluation started. Combined with
+    /// `policy.runtime_max_seconds()` it bounds how long any
+    /// effecting capability call is allowed to run before being
+    /// rejected with `RuntimeLimit`.
+    start_time: std::time::Instant,
 }
 
 impl HostCtx {
-    fn next_step(&self) -> u32 {
+    /// Bump the step counter AND enforce the wall-time deadline.
+    /// Every effecting builtin opens with `let step = ctx.begin_call(<cap>)?;`
+    /// so deadline-exceeded scripts fail before any audit event is
+    /// emitted or any work begins.
+    fn begin_call(&self, capability: &str) -> Result<u32, AegisError> {
+        self.check_deadline(capability)?;
         let mut s = self.step.borrow_mut();
         *s += 1;
-        *s
+        Ok(*s)
+    }
+
+    /// Bail with `RuntimeLimit` if the wall-time deadline has been
+    /// exceeded. Called at the top of every effecting capability
+    /// before any audit event or work begins, so a delayed agent
+    /// fails cleanly with a typed error instead of running the
+    /// effect.
+    fn check_deadline(&self, capability: &str) -> Result<(), AegisError> {
+        let Some(max_seconds) = self.policy.runtime_max_seconds() else {
+            return Ok(());
+        };
+        let elapsed = self.start_time.elapsed();
+        if elapsed.as_secs() < max_seconds {
+            return Ok(());
+        }
+        let msg = format!(
+            "wall-time deadline of {max_seconds}s exceeded ({:.1}s elapsed) at {capability}",
+            elapsed.as_secs_f64()
+        );
+        let step = *self.step.borrow();
+        self.emit(AuditEvent::denied(
+            &self.task_id,
+            step,
+            capability,
+            "deadline",
+            &msg,
+        ));
+        self.capture(CapturedKind::RuntimeLimit, &msg);
+        Err(AegisError::RuntimeLimit(msg))
     }
 
     fn require_confirm(&self, capability: &str, summary: String) -> Result<(), AegisError> {
@@ -361,7 +413,7 @@ fn dns_check(
 fn register_builtins(builder: &mut GlobalsBuilder) {
     fn _aegis_fs_read<'v>(path: &str, eval: &mut Evaluator<'v, '_, '_>) -> anyhow::Result<String> {
         let ctx = ctx_from_eval(eval)?;
-        let step = ctx.next_step();
+        let step = ctx.begin_call("fs.read")?;
         match ctx.policy.check_fs_read(Path::new(path)) {
             Ok(resolved) => {
                 ctx.require_confirm("fs.read", format!("read {}", resolved.display()))?;
@@ -402,7 +454,7 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
         let ctx = ctx_from_eval(eval)?;
-        let step = ctx.next_step();
+        let step = ctx.begin_call("fs.write")?;
         match ctx.policy.check_fs_write(Path::new(path)) {
             Ok(resolved) => {
                 ctx.require_confirm(
@@ -444,7 +496,7 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
         let ctx = ctx_from_eval(eval)?;
-        let step = ctx.next_step();
+        let step = ctx.begin_call("fs.delete")?;
         match ctx.policy.check_fs_delete(Path::new(path)) {
             Ok(resolved) => {
                 ctx.require_confirm("fs.delete", format!("delete {}", resolved.display()))?;
@@ -480,7 +532,7 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<String> {
         let ctx = ctx_from_eval(eval)?;
-        let step = ctx.next_step();
+        let step = ctx.begin_call("subprocess.exec")?;
         let argv = argv.items;
         if argv.is_empty() {
             return Err(anyhow::anyhow!("subprocess.exec: argv must not be empty"));
@@ -569,7 +621,7 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<String> {
         let ctx = ctx_from_eval(eval)?;
-        let step = ctx.next_step();
+        let step = ctx.begin_call("net.http_get")?;
         match ctx.policy.check_http_get(url) {
             Ok(parsed) => {
                 if let Some(host) = parsed.host_str() {
@@ -628,7 +680,7 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<String> {
         let ctx = ctx_from_eval(eval)?;
-        let step = ctx.next_step();
+        let step = ctx.begin_call("net.http_post")?;
         match ctx.policy.check_http_post(url) {
             Ok(parsed) => {
                 if let Some(host) = parsed.host_str() {
@@ -690,7 +742,7 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<String> {
         let ctx = ctx_from_eval(eval)?;
-        let step = ctx.next_step();
+        let step = ctx.begin_call("net.http_put")?;
         match ctx.policy.check_http_put(url) {
             Ok(parsed) => {
                 if let Some(host) = parsed.host_str() {
@@ -752,7 +804,7 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<String> {
         let ctx = ctx_from_eval(eval)?;
-        let step = ctx.next_step();
+        let step = ctx.begin_call("net.http_patch")?;
         match ctx.policy.check_http_patch(url) {
             Ok(parsed) => {
                 if let Some(host) = parsed.host_str() {
@@ -813,7 +865,7 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<String> {
         let ctx = ctx_from_eval(eval)?;
-        let step = ctx.next_step();
+        let step = ctx.begin_call("net.http_delete")?;
         match ctx.policy.check_http_delete(url) {
             Ok(parsed) => {
                 if let Some(host) = parsed.host_str() {
@@ -871,7 +923,7 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<String> {
         let ctx = ctx_from_eval(eval)?;
-        let step = ctx.next_step();
+        let step = ctx.begin_call("env.read")?;
         match ctx.policy.check_env_read(name) {
             Ok(()) => {
                 ctx.require_confirm("env.read", format!("read env var {name}"))?;

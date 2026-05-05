@@ -12,6 +12,7 @@ is allowed to do, and the runtime enforces it. This document covers:
   - [`[network]`](#network)
   - [`[environment]`](#environment)
   - [`[subprocess]`](#subprocess)
+  - [`[runtime]`](#runtime)
   - [`[tools]`](#tools)
   - [`confirm_per_call`](#confirm_per_call)
 - [Capabilities are derived, not declared](#capabilities-are-derived-not-declared)
@@ -271,6 +272,32 @@ in `$PATH`, list `"PATH"` in `allow_vars`. Same for `"HOME"`,
 A policy with empty `allow_vars` produces a fully empty child env;
 the subprocess must use absolute paths and won't have any standard
 shell environment.
+
+### `[runtime]`
+
+Resource caps applied to the Starlark evaluator itself.
+
+| Field                 | Effect                                                                                |
+|-----------------------|---------------------------------------------------------------------------------------|
+| `max_seconds`         | Wall-time cap (seconds). Checked at the entry of every effecting capability call. Past the deadline, the call returns a typed `RuntimeLimit` error before the action runs (exit code 6 in the CLI). `None` (default) ⇒ unlimited. |
+| `max_callstack_size`  | Maximum Starlark call-stack depth. Defends against recursion bombs. Forwarded to `Evaluator::set_max_callstack_size`. `None` (default) ⇒ Starlark's built-in default.                  |
+
+```toml
+[runtime]
+max_seconds        = 30
+max_callstack_size = 200
+```
+
+**Limitation worth knowing**: `max_seconds` is checked at
+capability-call entry, not on every Starlark statement. A pure
+busy-loop with no I/O (`def f(): return f()` is caught by
+`max_callstack_size`; a `for _ in range(10**9)` inside a `def`
+without any builtin call is NOT caught by either knob and will run
+to completion). Starlark has no public per-statement abort hook in
+the current upstream API. **For total isolation against malicious
+or runaway scripts, run Aegis inside a container.** This is the
+deliberate layering the threat model assumes — Aegis is the
+language-runtime gate, container/VM is the OS-isolation gate.
 
 ### `[tools]`
 

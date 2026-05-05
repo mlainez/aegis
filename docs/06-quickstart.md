@@ -119,6 +119,7 @@ The exit codes:
 | 3    | Pre-execution verifier rejection                  |
 | 4    | Confirm hook denied                               |
 | 5    | I/O or configuration error                        |
+| 6    | Runtime cap exceeded (wall-time / call-stack)     |
 
 ## 5. Try a confirm-prompted capability
 

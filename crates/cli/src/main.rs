@@ -14,6 +14,7 @@
 //!   3 — pre-execution verifier rejection
 //!   4 — confirm hook denied
 //!   5 — i/o or configuration error
+//!   6 — runtime cap exceeded (wall-time deadline / call-stack)
 
 mod init;
 
@@ -99,6 +100,7 @@ fn main() -> ExitCode {
                 CliError::Aegis(AegisError::Policy(_)) => ExitCode::from(2),
                 CliError::Aegis(AegisError::ConfirmDenied(_)) => ExitCode::from(4),
                 CliError::Aegis(AegisError::Starlark(_)) => ExitCode::from(1),
+                CliError::Aegis(AegisError::RuntimeLimit(_)) => ExitCode::from(6),
                 CliError::Aegis(AegisError::Io(_)) | CliError::Io(_) | CliError::Other(_) => {
                     ExitCode::from(5)
                 }
