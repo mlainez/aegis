@@ -90,10 +90,4 @@ bundle = [
     "exec rake db:drop",
 ]
 
-[functions]
-allow = [
-    "fs.read", "fs.write",
-    "net.http_get",
-    "subprocess.exec",
-    "env.read",
-]
+# Capabilities are auto-derived from the populated resource sections.

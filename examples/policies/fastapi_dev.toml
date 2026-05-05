@@ -61,10 +61,4 @@ pip = ["install --user", "install --break-system-packages"]
 uv = ["pip install --system"]
 poetry = ["publish"]
 
-[functions]
-allow = [
-    "fs.read", "fs.write",
-    "net.http_get",
-    "subprocess.exec",
-    "env.read",
-]
+# Capabilities are auto-derived from the populated resource sections.

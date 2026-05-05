@@ -1,13 +1,21 @@
-//! `aegis` CLI: load a policy and a Starlark script, run the script
-//! against the host with policy enforcement and audit logging.
+//! `aegis` CLI. Two subcommands:
 //!
-//! Exit codes:
+//! - `aegis run --policy <toml> <script.star>` — load a policy and a
+//!   Starlark script, run the script under capability-typed enforcement.
+//! - `aegis init --lang <python|node|ruby|rust|go> [--output PATH]` —
+//!   emit a starter policy file inheriting `secure-defaults`, with a
+//!   language-appropriate toolchain allowlist and git-destructive /
+//!   staging-config denies.
+//!
+//! Run exit codes:
 //!   0 — script ran to completion
 //!   1 — script error (Starlark eval failure)
 //!   2 — policy violation at runtime
 //!   3 — pre-execution verifier rejection
 //!   4 — confirm hook denied
 //!   5 — i/o or configuration error
+
+mod init;
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
@@ -19,14 +27,32 @@ use aegis_host::{
     DenyAllConfirm, JsonlAuditSink, Runner,
 };
 use aegis_policy::Policy;
-use clap::Parser;
+use clap::{Parser, Subcommand};
+
+use crate::init::Lang;
 
 #[derive(Parser, Debug)]
 #[command(name = "aegis", version, about = "Run Starlark agent scripts under capability-typed policy")]
 struct Cli {
-    /// Path to the policy TOML file.
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Run a Starlark script under a policy.
+    Run(RunArgs),
+    /// Generate a starter policy file for a project language.
+    Init(InitArgs),
+}
+
+#[derive(Parser, Debug)]
+struct RunArgs {
+    /// Path to the policy TOML file. If omitted, falls back to the
+    /// built-in `secure-defaults` baseline (denies every effecting
+    /// capability) and prints a banner explaining how to grant any.
     #[arg(short, long)]
-    policy: PathBuf,
+    policy: Option<PathBuf>,
 
     /// Starlark script to run.
     script: PathBuf,
@@ -45,8 +71,26 @@ struct Cli {
     yes: bool,
 }
 
+#[derive(Parser, Debug)]
+struct InitArgs {
+    /// Project language. Determines the toolchain allowlist and
+    /// project-layout read/write_allow defaults.
+    #[arg(short, long)]
+    lang: Lang,
+
+    /// Output path. Defaults to `aegis.toml` in the current directory.
+    /// Use `-` to write to stdout instead.
+    #[arg(short, long, default_value = "aegis.toml")]
+    output: String,
+
+    /// Overwrite an existing file at `--output`. Refused by default
+    /// to protect a pre-existing policy.
+    #[arg(short, long)]
+    force: bool,
+}
+
 fn main() -> ExitCode {
-    match run() {
+    match dispatch() {
         Ok(()) => ExitCode::from(0),
         Err(e) => {
             eprintln!("aegis: {e}");
@@ -74,26 +118,63 @@ enum CliError {
     Other(String),
 }
 
-fn run() -> Result<(), CliError> {
+fn dispatch() -> Result<(), CliError> {
     let cli = Cli::parse();
-    let policy = Policy::load(&cli.policy)
-        .map_err(|e| CliError::Other(format!("load policy {:?}: {e}", cli.policy)))?;
-    let script = std::fs::read_to_string(&cli.script)?;
-    let task_id = cli
+    match cli.command {
+        Command::Run(args) => run(args),
+        Command::Init(args) => init_cmd(args),
+    }
+}
+
+fn init_cmd(args: InitArgs) -> Result<(), CliError> {
+    let body = init::generate(args.lang);
+    if args.output == "-" {
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(body.as_bytes())?;
+        return Ok(());
+    }
+    let path = PathBuf::from(&args.output);
+    if path.exists() && !args.force {
+        return Err(CliError::Other(format!(
+            "{path:?} already exists; pass --force to overwrite"
+        )));
+    }
+    std::fs::write(&path, &body)?;
+    eprintln!(
+        "aegis: wrote {path} ({lang}). Review the file, then run with --policy {path}.",
+        path = path.display(),
+        lang = args.lang.name(),
+    );
+    Ok(())
+}
+
+fn run(args: RunArgs) -> Result<(), CliError> {
+    let policy = match args.policy.as_deref() {
+        Some(path) => Policy::load(path)
+            .map_err(|e| CliError::Other(format!("load policy {path:?}: {e}")))?,
+        None => {
+            print_no_policy_banner();
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            Policy::secure_defaults_at(cwd)
+                .map_err(|e| CliError::Other(format!("load secure-defaults baseline: {e}")))?
+        }
+    };
+    let script = std::fs::read_to_string(&args.script)?;
+    let task_id = args
         .task_id
         .unwrap_or_else(|| {
-            cli.script
+            args.script
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("script.star")
                 .to_string()
         });
 
-    let audit: Arc<dyn AuditSink> = match &cli.audit_log {
+    let audit: Arc<dyn AuditSink> = match &args.audit_log {
         Some(path) => Arc::new(JsonlAuditSink::file(path)?),
         None => Arc::new(JsonlAuditSink::stderr()),
     };
-    let confirm: Arc<dyn ConfirmHook> = if cli.yes {
+    let confirm: Arc<dyn ConfirmHook> = if args.yes {
         Arc::new(AllowAllConfirm)
     } else if std::io::stderr().is_terminal() && std::io::stdin().is_terminal() {
         Arc::new(TtyConfirm)
@@ -105,11 +186,24 @@ fn run() -> Result<(), CliError> {
         .with_audit(audit)
         .with_confirm_hook(confirm);
 
-    let outcome = runner.run(&task_id, &script, cli.script.to_string_lossy().as_ref())?;
+    let outcome = runner.run(&task_id, &script, args.script.to_string_lossy().as_ref())?;
     for line in &outcome.printed {
         println!("{line}");
     }
     Ok(())
+}
+
+/// Loud-and-safe banner shown when `aegis run` fires without `--policy`.
+/// Stderr only so it doesn't pollute structured stdout output.
+fn print_no_policy_banner() {
+    eprintln!("aegis: no --policy provided; using built-in `secure-defaults` baseline.");
+    eprintln!("       This baseline DENIES every fs / net / subprocess / env capability.");
+    eprintln!("       Pure computation and print() still work; every effect will fail.");
+    eprintln!("       To grant capabilities, generate a starter policy:");
+    eprintln!();
+    eprintln!("           aegis init --lang python   # or node, ruby, rust, go");
+    eprintln!();
+    eprintln!("       Then run with `--policy aegis.toml`. See examples/policies/ for templates.");
 }
 
 struct TtyConfirm;

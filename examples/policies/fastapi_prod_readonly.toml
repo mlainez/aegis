@@ -35,10 +35,4 @@ allow_commands = [
 [subprocess.deny_args]
 git = ["push", "commit", "merge", "rebase", "reset --hard", "clean"]
 
-[functions]
-allow = [
-    "fs.read",
-    "net.http_get",
-    "subprocess.exec",
-    "env.read",
-]
+# Capabilities are auto-derived from the populated resource sections.

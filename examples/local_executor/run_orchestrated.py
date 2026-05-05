@@ -238,6 +238,10 @@ def main() -> int:
         help="Include the GitHub-fetching tasks (be wary of rate limits).",
     )
     parser.add_argument(
+        "--all", action="store_true",
+        help="Run every task in run_multistep.TASKS (full 31-task suite).",
+    )
+    parser.add_argument(
         "--only", default=None,
         help="Run only the named task (must match a name in run_multistep.TASKS).",
     )
@@ -261,6 +265,8 @@ def main() -> int:
             print(f"unknown task: {args.only}", file=sys.stderr)
             return 2
         task_names = [args.only]
+    elif args.all:
+        task_names = [t.name for t in ms.TASKS]
     else:
         task_names = list(DEFAULT_SUBSET)
         if args.include_network:

@@ -41,9 +41,11 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Parser, Debug)]
 #[command(name = "aegis-mcp", version, about = "MCP server exposing the Aegis policy-gated runtime over stdio")]
 struct Cli {
-    /// Path to the policy TOML file.
+    /// Path to the policy TOML file. If omitted, falls back to the
+    /// built-in `secure-defaults` baseline (denies every effecting
+    /// capability) and prints a banner on stderr.
     #[arg(short, long)]
-    policy: PathBuf,
+    policy: Option<PathBuf>,
 
     /// Append audit events to this file (JSON Lines). Default: stderr.
     #[arg(long)]
@@ -52,8 +54,19 @@ struct Cli {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let policy = Policy::load(&cli.policy)
-        .map_err(|e| anyhow::anyhow!("load policy {:?}: {e}", cli.policy))?;
+    let policy = match cli.policy.as_deref() {
+        Some(path) => Policy::load(path)
+            .map_err(|e| anyhow::anyhow!("load policy {path:?}: {e}"))?,
+        None => {
+            eprintln!(
+                "aegis-mcp: no --policy provided; using built-in `secure-defaults` baseline. \
+This denies every fs/net/subprocess/env capability — every tool call will fail \
+until you launch with --policy <project.toml>. See examples/policies/ for templates."
+            );
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            Policy::secure_defaults_at(cwd)?
+        }
+    };
     let audit: Arc<dyn AuditSink> = match &cli.audit_log {
         Some(path) => Arc::new(JsonlAuditSink::file(path)?),
         None => Arc::new(JsonlAuditSink::stderr()),

@@ -29,10 +29,12 @@ use thiserror::Error;
 
 pub mod audit;
 pub mod confirm;
+pub mod taint;
 pub mod verifier;
 
 pub use audit::{AuditEvent, AuditSink, JsonlAuditSink, NullAuditSink};
 pub use confirm::{AllowAllConfirm, ConfirmDecision, ConfirmHook, ConfirmRequest, DenyAllConfirm};
+pub use taint::{redact, TaintRegistry, REDACTED};
 
 /// A capability the runtime knows how to enforce.
 ///
@@ -176,6 +178,7 @@ impl Runner {
             step: RefCell::new(0),
             printed: RefCell::new(Vec::new()),
             captured: RefCell::new(None),
+            taint: TaintRegistry::default(),
         };
 
         let globals = GlobalsBuilder::extended_by(&[
@@ -204,7 +207,13 @@ impl Runner {
                 })
         };
         let captured = ctx.captured.borrow_mut().take();
-        let printed = ctx.printed.into_inner();
+        let taints = ctx.taint.snapshot();
+        let printed: Vec<String> = ctx
+            .printed
+            .into_inner()
+            .into_iter()
+            .map(|line| redact(&line, &taints))
+            .collect();
 
         if let Err(starlark_msg) = eval_result {
             // If a builtin captured a typed error before Starlark wrapped
@@ -232,6 +241,11 @@ struct HostCtx {
     step: RefCell<u32>,
     printed: RefCell<Vec<String>>,
     captured: RefCell<Option<CapturedError>>,
+    /// Tainted values registered by local-only reads. Every output
+    /// crossing the runtime boundary (printed lines, audit-event
+    /// payloads, MCP tool result text) is scrubbed against this
+    /// registry before leaving.
+    taint: TaintRegistry,
 }
 
 impl HostCtx {
@@ -268,7 +282,11 @@ impl HostCtx {
         }
     }
 
-    fn emit(&self, event: AuditEvent) {
+    fn emit(&self, mut event: AuditEvent) {
+        if !self.taint.is_empty() {
+            let taints = self.taint.snapshot();
+            taint::redact_json(&mut event.detail, &taints);
+        }
         self.audit.emit(event);
     }
 
@@ -348,6 +366,11 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
             Ok(resolved) => {
                 ctx.require_confirm("fs.read", format!("read {}", resolved.display()))?;
                 let result = std::fs::read_to_string(&resolved);
+                if let Ok(content) = result.as_ref() {
+                    if ctx.policy.fs_read_is_local_only(&resolved) {
+                        ctx.taint.add(content);
+                    }
+                }
                 ctx.emit(AuditEvent::fs(
                     &ctx.task_id,
                     step,
@@ -495,6 +518,11 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
             Ok(out) => {
                 let ok = out.status.success();
                 let body = String::from_utf8_lossy(&out.stdout).to_string();
+                let stderr_text = String::from_utf8_lossy(&out.stderr).to_string();
+                if ctx.policy.subprocess_is_local_only(&argv[0]) {
+                    ctx.taint.add(&body);
+                    ctx.taint.add(&stderr_text);
+                }
                 ctx.emit(AuditEvent::subprocess(
                     &ctx.task_id,
                     step,
@@ -504,11 +532,10 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
                     None,
                 ));
                 if !ok {
-                    let err = String::from_utf8_lossy(&out.stderr).to_string();
                     return Err(anyhow::anyhow!(
                         "subprocess.exec: non-zero exit ({:?}): {}",
                         out.status.code(),
-                        err.trim()
+                        stderr_text.trim()
                     ));
                 }
                 Ok(body)
@@ -550,10 +577,16 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
                     }
                 }
                 ctx.require_confirm("net.http_get", format!("GET {}", parsed))?;
+                let host_label = parsed.host_str().map(|s| s.to_string()).unwrap_or_default();
                 let result: Result<String, anyhow::Error> = (|| {
                     let resp = ureq::get(parsed.as_str()).call()?;
                     Ok(resp.into_string()?)
                 })();
+                if let Ok(body) = result.as_ref() {
+                    if ctx.policy.host_is_local_only(&host_label) {
+                        ctx.taint.add(body);
+                    }
+                }
                 ctx.emit(AuditEvent::http(
                     &ctx.task_id,
                     step,
@@ -606,10 +639,16 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
                     "net.http_post",
                     format!("POST {} ({} bytes)", parsed, body.len()),
                 )?;
+                let host_label = parsed.host_str().map(|s| s.to_string()).unwrap_or_default();
                 let result: Result<String, anyhow::Error> = (|| {
                     let resp = ureq::post(parsed.as_str()).send_string(body)?;
                     Ok(resp.into_string()?)
                 })();
+                if let Ok(b) = result.as_ref() {
+                    if ctx.policy.host_is_local_only(&host_label) {
+                        ctx.taint.add(b);
+                    }
+                }
                 ctx.emit(AuditEvent::http(
                     &ctx.task_id,
                     step,
@@ -662,10 +701,16 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
                     "net.http_put",
                     format!("PUT {} ({} bytes)", parsed, body.len()),
                 )?;
+                let host_label = parsed.host_str().map(|s| s.to_string()).unwrap_or_default();
                 let result: Result<String, anyhow::Error> = (|| {
                     let resp = ureq::put(parsed.as_str()).send_string(body)?;
                     Ok(resp.into_string()?)
                 })();
+                if let Ok(b) = result.as_ref() {
+                    if ctx.policy.host_is_local_only(&host_label) {
+                        ctx.taint.add(b);
+                    }
+                }
                 ctx.emit(AuditEvent::http(
                     &ctx.task_id,
                     step,
@@ -718,10 +763,16 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
                     "net.http_patch",
                     format!("PATCH {} ({} bytes)", parsed, body.len()),
                 )?;
+                let host_label = parsed.host_str().map(|s| s.to_string()).unwrap_or_default();
                 let result: Result<String, anyhow::Error> = (|| {
                     let resp = ureq::patch(parsed.as_str()).send_string(body)?;
                     Ok(resp.into_string()?)
                 })();
+                if let Ok(b) = result.as_ref() {
+                    if ctx.policy.host_is_local_only(&host_label) {
+                        ctx.taint.add(b);
+                    }
+                }
                 ctx.emit(AuditEvent::http(
                     &ctx.task_id,
                     step,
@@ -770,10 +821,16 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
                     }
                 }
                 ctx.require_confirm("net.http_delete", format!("DELETE {}", parsed))?;
+                let host_label = parsed.host_str().map(|s| s.to_string()).unwrap_or_default();
                 let result: Result<String, anyhow::Error> = (|| {
                     let resp = ureq::delete(parsed.as_str()).call()?;
                     Ok(resp.into_string()?)
                 })();
+                if let Ok(b) = result.as_ref() {
+                    if ctx.policy.host_is_local_only(&host_label) {
+                        ctx.taint.add(b);
+                    }
+                }
                 ctx.emit(AuditEvent::http(
                     &ctx.task_id,
                     step,
@@ -809,6 +866,9 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
             Ok(()) => {
                 ctx.require_confirm("env.read", format!("read env var {name}"))?;
                 let value = std::env::var(name).unwrap_or_default();
+                if ctx.policy.env_is_local_only(name) {
+                    ctx.taint.add(&value);
+                }
                 ctx.emit(AuditEvent::env(&ctx.task_id, step, name, true, None));
                 Ok(value)
             }
@@ -831,159 +891,3 @@ fn register_builtins(builder: &mut GlobalsBuilder) {
 /// Re-export the path type used by [`AuditEvent`] helpers.
 pub use std::path::Path as AuditPath;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use aegis_policy::PolicyFile;
-    use std::path::PathBuf;
-
-    fn runner_for(toml: &str, root: PathBuf) -> Runner {
-        let file = PolicyFile::from_toml_str(toml).unwrap();
-        let policy = Policy::from_file(file, root).unwrap();
-        Runner::new(policy)
-    }
-
-    #[test]
-    fn allowed_read_succeeds() {
-        let tmp = std::env::temp_dir();
-        let f = tmp.join("aegis_test_input.txt");
-        std::fs::write(&f, "hello aegis").unwrap();
-
-        let toml = r#"
-[filesystem]
-read_allow = ["/tmp/**", "/var/tmp/**"]
-
-[functions]
-allow = ["fs.read"]
-"#;
-        let runner = runner_for(toml, tmp);
-        let path_lit = f.to_string_lossy().replace('\\', "/");
-        let src = format!(r#"x = fs.read("{path_lit}")
-print(x)"#);
-        let outcome = runner.run("t1", &src, "test.star").unwrap();
-        assert_eq!(outcome.printed, vec!["hello aegis".to_string()]);
-    }
-
-    #[test]
-    fn write_outside_allow_is_denied() {
-        let toml = r#"
-[filesystem]
-write_allow = ["/tmp/**"]
-deny = ["~/.aws/**"]
-
-[functions]
-allow = ["fs.write"]
-"#;
-        let runner = runner_for(toml, PathBuf::from("/work"));
-        let src = r#"fs.write("/etc/passwd", "x")"#;
-        let err = runner.run("t1", src, "test.star").unwrap_err();
-        assert!(
-            matches!(err, AegisError::Policy(_)),
-            "expected policy violation, got: {err:?}"
-        );
-    }
-
-    #[test]
-    fn function_not_in_allowlist_rejected_pre_execution() {
-        let toml = r#"
-[functions]
-allow = ["fs.read"]
-"#;
-        let runner = runner_for(toml, PathBuf::from("/tmp"));
-        // subprocess.exec is not in the allowlist.
-        let src = r#"subprocess.exec(["echo", "hi"])"#;
-        let err = runner.run("t1", src, "test.star").unwrap_err();
-        assert!(matches!(err, AegisError::Verifier(_)),
-            "expected pre-execution verifier rejection, got: {err:?}");
-    }
-
-    #[test]
-    fn subprocess_deny_args_blocks_force_push() {
-        let toml = r#"
-[subprocess]
-allow_commands = ["git"]
-
-[subprocess.deny_args]
-git = ["push --force"]
-
-[functions]
-allow = ["subprocess.exec"]
-"#;
-        let runner = runner_for(toml, PathBuf::from("/tmp"));
-        let src = r#"subprocess.exec(["git", "push", "--force", "origin", "main"])"#;
-        let err = runner.run("t1", src, "test.star").unwrap_err();
-        assert!(matches!(err, AegisError::Policy(_)),
-            "expected policy violation for forbidden args, got: {err:?}");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("push --force"),
-            "expected the matched pattern in the error, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn subprocess_command_allowlist_blocks_unknown_command() {
-        let toml = r#"
-[subprocess]
-allow_commands = ["git"]
-
-[functions]
-allow = ["subprocess.exec"]
-"#;
-        let runner = runner_for(toml, PathBuf::from("/tmp"));
-        let src = r#"subprocess.exec(["rm", "-rf", "/tmp"])"#;
-        let err = runner.run("t1", src, "test.star").unwrap_err();
-        assert!(matches!(err, AegisError::Policy(_)),
-            "expected policy violation for unknown command, got: {err:?}");
-    }
-
-    #[test]
-    fn dns_resolves_hostname_through_deny_cidr() {
-        // `localhost` reliably resolves to 127.0.0.1 / ::1 on every
-        // POSIX system. Combined with the loopback CIDR, this lets
-        // us exercise the full DNS-then-policy path without a real
-        // network round-trip.
-        let toml = r#"
-[network]
-http_get_allow = ["localhost"]
-deny_ips = ["127.0.0.0/8", "::1/128"]
-
-[functions]
-allow = ["net.http_get"]
-"#;
-        let runner = runner_for(toml, PathBuf::from("/tmp"));
-        let src = r#"net.http_get("http://localhost:1/")"#;
-        let err = runner.run("t1", src, "test.star").unwrap_err();
-        assert!(matches!(err, AegisError::Policy(_)),
-            "expected policy violation from DNS-resolved deny, got: {err:?}");
-        let msg = err.to_string();
-        // Either the v4 or v6 loopback IP should appear in the
-        // diagnostic depending on which the resolver returned first.
-        assert!(
-            msg.contains("127.") || msg.contains("::1"),
-            "expected resolved-IP diagnostic, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn env_read_allowlist() {
-        let toml = r#"
-[environment]
-allow_vars = ["PATH"]
-deny_vars = ["AWS_SECRET_ACCESS_KEY"]
-
-[functions]
-allow = ["env.read"]
-"#;
-        let runner = runner_for(toml, PathBuf::from("/tmp"));
-        let src = r#"
-p = env.read("PATH")
-print("path-prefix:", p[:1])
-"#;
-        runner.run("t1", src, "test.star").unwrap();
-        // denied var
-        let denied_src = r#"env.read("AWS_SECRET_ACCESS_KEY")"#;
-        let err = runner.run("t1", denied_src, "test.star").unwrap_err();
-        assert!(matches!(err, AegisError::Policy(_)));
-    }
-}

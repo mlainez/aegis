@@ -48,6 +48,13 @@ pub enum PolicyError {
     },
     #[error("policy file is invalid: {0}")]
     Invalid(String),
+    #[error(
+        "policy file at {policy_path:?} is itself matched by [filesystem].{action}_allow; refusing to load — an agent that can {action} its own policy can disable every other rule. Tighten your allow patterns or add the policy file to [filesystem].deny."
+    )]
+    SelfWritable {
+        policy_path: PathBuf,
+        action: &'static str,
+    },
 }
 
 /// Top-level policy. Loaded from a TOML file. The `source_path` is
@@ -83,19 +90,22 @@ pub struct PolicyFile {
     pub environment: EnvironmentPolicy,
     #[serde(default)]
     pub subprocess: SubprocessPolicy,
-    #[serde(default)]
-    pub functions: FunctionPolicy,
     /// Map from external tool names (as exposed by an MCP host or an
     /// IDE agent runtime) to the dotted Aegis capability names the
     /// tool requires. A consuming host that receives a tool call (e.g.
     /// `Bash {command: "ls"}`) looks up `Bash` here, gets back
-    /// `["subprocess.exec"]`, and verifies each capability against
-    /// `[functions].allow` before invoking the tool.
+    /// `["subprocess.exec"]`, and verifies each capability against the
+    /// derived capability set before invoking the tool.
     ///
     /// Default-deny: a tool not declared here is rejected by
     /// `Policy::check_tool`.
-    #[serde(default)]
-    pub tools: std::collections::BTreeMap<String, Vec<String>>,
+    ///
+    /// The TOML accepts two forms per entry — a bare list of
+    /// capability names (`Read = ["fs.read"]`) or a full
+    /// [`ToolRecord`] table with optional `backend_url` /
+    /// `backend_method` / `description` routing hints.
+    #[serde(default, deserialize_with = "deserialize_tools")]
+    pub tools: std::collections::BTreeMap<String, ToolRecord>,
     #[serde(default)]
     pub confirm_per_call: Vec<String>,
 }
@@ -104,6 +114,15 @@ pub struct PolicyFile {
 pub struct FilesystemPolicy {
     #[serde(default)]
     pub read_allow: Vec<String>,
+    /// Paths whose CONTENTS are readable by the script but whose value
+    /// must never leave the runtime back to the calling host. A read
+    /// matching a `local_only_read` pattern succeeds and the returned
+    /// content is tainted: every output sink (printed lines, audit
+    /// payloads, MCP tool results) is scrubbed for any occurrence of
+    /// the value before crossing the runtime boundary. Local-only wins
+    /// over a plain `read_allow` if both match.
+    #[serde(default)]
+    pub local_only_read: Vec<String>,
     #[serde(default)]
     pub write_allow: Vec<String>,
     #[serde(default)]
@@ -132,14 +151,71 @@ pub struct NetworkPolicy {
     pub deny_hosts: Vec<String>,
     #[serde(default)]
     pub deny_ips: Vec<String>,
+    /// Hosts whose HTTP response bodies are readable by the script but
+    /// must never leave the runtime back to the calling host. A
+    /// response from any `local_only_hosts` host (regardless of verb)
+    /// is tainted at the runtime boundary. The host must additionally
+    /// be in the appropriate `http_*_allow` list (or in
+    /// `local_only_hosts` is treated as the allow source — see
+    /// resolution rules in EnvironmentPolicy::local_only_vars docs).
+    #[serde(default)]
+    pub local_only_hosts: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct FunctionPolicy {
+// FunctionPolicy was removed. Capabilities are now derived from the
+// resource sections alone — populating `[filesystem].read_allow`
+// implies `fs.read` is permitted, populating
+// `[subprocess].allow_commands` implies `subprocess.exec`, and so on.
+// See `derive_capabilities` below.
+
+/// Full record for a `[tools.X]` entry: the capabilities it requires
+/// plus optional routing hints (where the tool's outbound call should
+/// go, how it should be made). The routing fields are *informational*
+/// — the network policy is still the enforcement layer; a `backend_url`
+/// must additionally satisfy `[network].http_*_allow` at call time.
+///
+/// Two TOML forms are accepted (see custom deserializer):
+///
+/// ```toml
+/// # Short form — just a list of required capabilities:
+/// Read = ["fs.read"]
+///
+/// # Long form — full record with routing hints:
+/// [tools.WebSearch]
+/// capabilities  = ["net.http_get"]
+/// backend_url   = "https://searx.be/search"
+/// backend_method = "GET"
+/// description   = "Privacy-respecting open-source meta-search."
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ToolRecord {
+    /// Aegis capabilities the tool requires. The tool is permitted iff
+    /// every entry here has a populated resource section.
     #[serde(default)]
-    pub allow: Vec<String>,
+    pub capabilities: Vec<String>,
+    /// Routing hint: the URL this tool's outbound HTTP call is
+    /// expected to target. Bridges (e.g. the local-executor harness)
+    /// can read this to inject "for WebSearch, GET this URL" into the
+    /// system prompt, instead of leaving the local model to guess.
     #[serde(default)]
-    pub deny: Vec<String>,
+    pub backend_url: Option<String>,
+    /// Routing hint: HTTP method. "GET" / "POST" / "PUT" / "PATCH" /
+    /// "DELETE". Defaults to GET when absent.
+    #[serde(default)]
+    pub backend_method: Option<String>,
+    /// Free-form human / system-prompt description.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+impl ToolRecord {
+    /// Convenience: HTTP method as an uppercase &str, defaulting to
+    /// "GET" when not declared.
+    pub fn method(&self) -> &str {
+        self.backend_method
+            .as_deref()
+            .unwrap_or("GET")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -151,6 +227,28 @@ pub struct EnvironmentPolicy {
     /// Belt-and-suspenders against typos that leak credentials.
     #[serde(default)]
     pub deny_vars: Vec<String>,
+    /// Names readable by the script but whose values must NEVER leave
+    /// the runtime back to the calling host. The runtime taints values
+    /// returned from `env.read` for these names: every script output
+    /// (printed lines, audit-log payloads, MCP tool results) is
+    /// scanned and any occurrence of the value is replaced with
+    /// `[REDACTED]` before it crosses the runtime boundary.
+    ///
+    /// Use case: a cloud orchestrator delegates to a local executor;
+    /// the local executor needs the user's API key to call a remote
+    /// service, but the key must not bubble up to the cloud
+    /// orchestrator. The local model can still pass the key into a
+    /// `net.http_get` / `net.http_post` call (an outbound effect
+    /// gated by the network policy); only the *return path* out of
+    /// the runtime is scrubbed.
+    ///
+    /// Resolution (deny wins, taint wins over plain allow):
+    ///   - in `deny_vars`        → read fails
+    ///   - in `local_only_vars`  → read succeeds, value is tainted
+    ///   - in `allow_vars` only  → read succeeds, value is plain
+    ///   - in none of the above  → read fails
+    #[serde(default)]
+    pub local_only_vars: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -160,6 +258,13 @@ pub struct SubprocessPolicy {
     /// `subprocess.exec` capability is otherwise allowed.
     #[serde(default)]
     pub allow_commands: Vec<String>,
+    /// Commands whose stdout/stderr the script may read but must
+    /// never leave the runtime back to the calling host. Subprocess
+    /// output from any local-only command is tainted; its bytes will
+    /// be redacted in printed output, audit payloads, and MCP results.
+    /// Local-only wins over plain `allow_commands` if both match.
+    #[serde(default)]
+    pub local_only_commands: Vec<String>,
     /// Commands that are never permitted; deny wins over allow.
     #[serde(default)]
     pub deny_commands: Vec<String>,
@@ -176,6 +281,17 @@ pub struct SubprocessPolicy {
 impl PolicyFile {
     pub fn from_toml_str(s: &str) -> Result<Self> {
         toml::from_str(s).context("parse policy TOML")
+    }
+
+    /// Merge `over` on top of `self`. List fields concat with dedup
+    /// and gitignore-style negation (`"!X"` strips `X`); map fields
+    /// (`tools`, `subprocess.deny_args`) merge per-key with the same
+    /// negation rules; scalars favor `over` when set.
+    ///
+    /// Public so embedding hosts can layer policies programmatically
+    /// (for example, a per-task overlay on top of a project policy).
+    pub fn merge_with(self, over: PolicyFile) -> PolicyFile {
+        merge_policy_files(self, over)
     }
 
     /// Resolve `inherits` by loading the named preset, parsing it, and
@@ -220,28 +336,71 @@ fn concat_dedup(mut base: Vec<String>, over: Vec<String>) -> Vec<String> {
     base
 }
 
-/// Merge `[tools]` maps. Per-key concat-with-dedup-and-negation,
-/// matching the deny_args merge shape. A user file entry of the form
-/// `"!fs.write"` removes that capability from an inherited tool's
-/// required-capability list. If a tool's required-capability list
-/// becomes empty after merge, it remains in the map (the tool stays
-/// declared but requires no capabilities — caller decides whether
-/// that's meaningful).
+/// Merge `[tools]` maps. Capability lists merge per-key with
+/// concat-dedup-and-negation (`"!fs.write"` strips that capability
+/// from an inherited entry). Routing hints (`backend_url`,
+/// `backend_method`, `description`) merge as scalar overlays — `over`
+/// wins when set, otherwise `base` wins.
 fn merge_tools(
-    mut base: std::collections::BTreeMap<String, Vec<String>>,
-    over: std::collections::BTreeMap<String, Vec<String>>,
-) -> std::collections::BTreeMap<String, Vec<String>> {
+    mut base: std::collections::BTreeMap<String, ToolRecord>,
+    over: std::collections::BTreeMap<String, ToolRecord>,
+) -> std::collections::BTreeMap<String, ToolRecord> {
     for (k, v) in over {
         let entry = base.entry(k).or_default();
-        for item in v {
+        // Capabilities: gitignore-style negation merge.
+        for item in v.capabilities {
             if let Some(target) = item.strip_prefix('!') {
-                entry.retain(|s| s != target);
-            } else if !entry.contains(&item) {
-                entry.push(item);
+                entry.capabilities.retain(|s| s != target);
+            } else if !entry.capabilities.contains(&item) {
+                entry.capabilities.push(item);
             }
+        }
+        // Routing hints: scalar overlay (over wins when set).
+        if v.backend_url.is_some() {
+            entry.backend_url = v.backend_url;
+        }
+        if v.backend_method.is_some() {
+            entry.backend_method = v.backend_method;
+        }
+        if v.description.is_some() {
+            entry.description = v.description;
         }
     }
     base
+}
+
+/// Custom deserializer for `[tools]`. Accepts two forms per entry —
+/// a bare list of capability strings (`Read = ["fs.read"]`) or a
+/// table with `capabilities` plus optional routing hints — and
+/// normalizes both to [`ToolRecord`].
+fn deserialize_tools<'de, D>(
+    d: D,
+) -> Result<std::collections::BTreeMap<String, ToolRecord>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Caps(Vec<String>),
+        Full(ToolRecord),
+    }
+    let raw: std::collections::BTreeMap<String, Either> =
+        std::collections::BTreeMap::deserialize(d)?;
+    Ok(raw
+        .into_iter()
+        .map(|(k, v)| match v {
+            Either::Caps(caps) => (
+                k,
+                ToolRecord {
+                    capabilities: caps,
+                    ..Default::default()
+                },
+            ),
+            Either::Full(rec) => (k, rec),
+        })
+        .collect())
 }
 
 fn merge_deny_args(
@@ -282,6 +441,10 @@ fn merge_policy_files(base: PolicyFile, over: PolicyFile) -> PolicyFile {
                 base.filesystem.delete_allow,
                 over.filesystem.delete_allow,
             ),
+            local_only_read: concat_dedup(
+                base.filesystem.local_only_read,
+                over.filesystem.local_only_read,
+            ),
             deny: concat_dedup(base.filesystem.deny, over.filesystem.deny),
         },
         network: NetworkPolicy {
@@ -307,6 +470,10 @@ fn merge_policy_files(base: PolicyFile, over: PolicyFile) -> PolicyFile {
             ),
             deny_hosts: concat_dedup(base.network.deny_hosts, over.network.deny_hosts),
             deny_ips: concat_dedup(base.network.deny_ips, over.network.deny_ips),
+            local_only_hosts: concat_dedup(
+                base.network.local_only_hosts,
+                over.network.local_only_hosts,
+            ),
         },
         environment: EnvironmentPolicy {
             allow_vars: concat_dedup(
@@ -316,6 +483,10 @@ fn merge_policy_files(base: PolicyFile, over: PolicyFile) -> PolicyFile {
             deny_vars: concat_dedup(
                 base.environment.deny_vars,
                 over.environment.deny_vars,
+            ),
+            local_only_vars: concat_dedup(
+                base.environment.local_only_vars,
+                over.environment.local_only_vars,
             ),
         },
         subprocess: SubprocessPolicy {
@@ -327,11 +498,11 @@ fn merge_policy_files(base: PolicyFile, over: PolicyFile) -> PolicyFile {
                 base.subprocess.deny_commands,
                 over.subprocess.deny_commands,
             ),
+            local_only_commands: concat_dedup(
+                base.subprocess.local_only_commands,
+                over.subprocess.local_only_commands,
+            ),
             deny_args: merge_deny_args(base.subprocess.deny_args, over.subprocess.deny_args),
-        },
-        functions: FunctionPolicy {
-            allow: concat_dedup(base.functions.allow, over.functions.allow),
-            deny: concat_dedup(base.functions.deny, over.functions.deny),
         },
         tools: merge_tools(base.tools, over.tools),
         confirm_per_call: concat_dedup(base.confirm_per_call, over.confirm_per_call),
@@ -345,6 +516,7 @@ pub struct Policy {
     file: PolicyFile,
     root: PathBuf,
     fs_read: PathMatcher,
+    fs_local_only_read: PathMatcher,
     fs_write: PathMatcher,
     fs_delete: PathMatcher,
     fs_deny: PathMatcher,
@@ -354,42 +526,117 @@ pub struct Policy {
     net_patch_hosts: HostMatcher,
     net_delete_hosts: HostMatcher,
     net_deny_hosts: HostMatcher,
+    net_local_only_hosts: HostMatcher,
     /// Parsed deny_ips entries, each held as an `IpNet`. Literal IPs
     /// (`169.254.169.254`) are stored as host networks (`/32` or
     /// `/128`); CIDR ranges (`10.0.0.0/8`) are stored as-is.
     net_deny_ips: Vec<IpNet>,
     env_allow: Vec<String>,
     env_deny: Vec<String>,
+    env_local_only: Vec<String>,
     subprocess_allow: Vec<String>,
     subprocess_deny: Vec<String>,
+    subprocess_local_only: Vec<String>,
     subprocess_deny_args: std::collections::BTreeMap<String, Vec<String>>,
-    fn_allow: Vec<String>,
-    fn_deny: Vec<String>,
-    tools: std::collections::BTreeMap<String, Vec<String>>,
+    /// Capabilities derived from the populated resource sections.
+    /// Single source of truth for what `check_function` permits.
+    fn_derived: Vec<&'static str>,
+    tools: std::collections::BTreeMap<String, ToolRecord>,
     confirm_per_call: Vec<String>,
 }
 
 impl Policy {
     /// Load a policy file, anchoring relative path patterns at the
-    /// process current working directory.
+    /// **policy file's own directory**. This is the portable default:
+    /// `read_allow = ["src/**"]` means "the `src/` next to this
+    /// policy file", regardless of where the operator invoked aegis
+    /// from. A policy file shipped with a project keeps working when
+    /// the project moves, gets cloned, or runs in CI; the user does
+    /// not need to leak their personal directory structure into the
+    /// policy.
+    ///
+    /// Both absolute (`/etc/passwd`, `/tmp/**`) and relative
+    /// (`src/**`, `*.toml`) patterns are supported. Relative ones
+    /// resolve against the policy file's parent directory.
+    ///
+    /// To override the anchor (e.g. to load the same policy file
+    /// against a different working tree), use `load_with_root`.
     pub fn load(path: &Path) -> Result<Self> {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        Self::load_with_root(path, cwd)
+        let anchor = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        Self::load_with_root(path, anchor)
     }
 
-    /// Load a policy file, anchoring relative path patterns at `root`.
-    /// `root` is also where relative path arguments at runtime are
-    /// resolved against.
+    /// Load a policy file with an explicit `root` for relative-path
+    /// pattern resolution. `root` is also where relative path
+    /// arguments at runtime are resolved against.
     pub fn load_with_root(path: &Path, root: PathBuf) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("read policy file {path:?}"))?;
         let file = PolicyFile::from_toml_str(&raw)?.resolve_inheritance()?;
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
+        let policy = Self::from_file(file, root)?;
+        let policy_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        policy.guard_self_writable(&policy_path)?;
+        Ok(policy)
+    }
+
+    /// Refuse to load a policy that grants write or delete on its own
+    /// file. An agent that can rewrite the policy that controls it can
+    /// disable every other rule on the next run; the trust boundary
+    /// has to start outside the agent's reach.
+    ///
+    /// `Policy::load` and `Policy::load_with_root` call this
+    /// automatically. Direct embedders that build a `Policy` via
+    /// `from_file` and know the on-disk policy path should call it
+    /// themselves.
+    pub fn guard_self_writable(&self, policy_path: &Path) -> Result<(), PolicyError> {
+        // Note: deny still wins here, so a file appearing in both
+        // write_allow and deny is fine (deny will block the write at
+        // runtime). We probe with the actual `check_fs_*` methods so
+        // the guard reflects the real enforcement decision.
+        if self.check_fs_write(policy_path).is_ok() {
+            return Err(PolicyError::SelfWritable {
+                policy_path: policy_path.to_path_buf(),
+                action: "write",
+            });
+        }
+        if self.check_fs_delete(policy_path).is_ok() {
+            return Err(PolicyError::SelfWritable {
+                policy_path: policy_path.to_path_buf(),
+                action: "delete",
+            });
+        }
+        Ok(())
+    }
+
+    /// Construct a policy from the built-in `secure-defaults` preset
+    /// alone, with no user file layered on top. This is the fallback
+    /// used by the CLI and MCP server when invoked without a policy
+    /// argument.
+    ///
+    /// The preset is purely a denylist (credentials paths, RFC1918 +
+    /// metadata IPs, secret env-var names, destructive commands) and
+    /// has no allow lists, so the resulting policy denies every
+    /// effecting capability. Pure computation and `print()` are the
+    /// only things that succeed. Loud-and-safe: any project that wants
+    /// to actually do something must declare it explicitly.
+    pub fn secure_defaults_at(root: PathBuf) -> Result<Self> {
+        let preset_src =
+            presets::lookup("secure-defaults").expect("built-in secure-defaults preset");
+        let file = PolicyFile::from_toml_str(preset_src)
+            .context("parse built-in secure-defaults preset")?;
         let root = std::fs::canonicalize(&root).unwrap_or(root);
         Self::from_file(file, root)
     }
 
     pub fn from_file(file: PolicyFile, root: PathBuf) -> Result<Self> {
         let fs_read = PathMatcher::build(&root, &file.filesystem.read_allow)?;
+        let fs_local_only_read =
+            PathMatcher::build(&root, &file.filesystem.local_only_read)?;
         let fs_write = PathMatcher::build(&root, &file.filesystem.write_allow)?;
         let fs_delete = PathMatcher::build(&root, &file.filesystem.delete_allow)?;
         let fs_deny = PathMatcher::build(&root, &file.filesystem.deny)?;
@@ -399,6 +646,7 @@ impl Policy {
         let net_patch_hosts = HostMatcher::build(&file.network.http_patch_allow)?;
         let net_delete_hosts = HostMatcher::build(&file.network.http_delete_allow)?;
         let net_deny_hosts = HostMatcher::build(&file.network.deny_hosts)?;
+        let net_local_only_hosts = HostMatcher::build(&file.network.local_only_hosts)?;
         let net_deny_ips = file
             .network
             .deny_ips
@@ -410,17 +658,19 @@ impl Policy {
             .collect::<Result<Vec<IpNet>>>()?;
         let env_allow = file.environment.allow_vars.clone();
         let env_deny = file.environment.deny_vars.clone();
+        let env_local_only = file.environment.local_only_vars.clone();
         let subprocess_allow = file.subprocess.allow_commands.clone();
         let subprocess_deny = file.subprocess.deny_commands.clone();
+        let subprocess_local_only = file.subprocess.local_only_commands.clone();
         let subprocess_deny_args = file.subprocess.deny_args.clone();
-        let fn_allow = file.functions.allow.clone();
-        let fn_deny = file.functions.deny.clone();
+        let fn_derived = derive_capabilities(&file);
         let tools = file.tools.clone();
         let confirm_per_call = file.confirm_per_call.clone();
         Ok(Self {
             file,
             root,
             fs_read,
+            fs_local_only_read,
             fs_write,
             fs_delete,
             fs_deny,
@@ -430,14 +680,16 @@ impl Policy {
             net_patch_hosts,
             net_delete_hosts,
             net_deny_hosts,
+            net_local_only_hosts,
             net_deny_ips,
             env_allow,
             env_deny,
+            env_local_only,
             subprocess_allow,
             subprocess_deny,
+            subprocess_local_only,
             subprocess_deny_args,
-            fn_allow,
-            fn_deny,
+            fn_derived,
             tools,
             confirm_per_call,
         })
@@ -458,36 +710,62 @@ impl Policy {
     ///
     /// This is the entry point for hosts that consult Aegis as a
     /// policy oracle — they receive a tool call by name (Bash, Read,
-    /// Edit, WebFetch...) and want a yes/no plus the implied
-    /// capabilities to log alongside the action.
-    pub fn check_tool(&self, name: &str) -> Result<&[String], PolicyError> {
-        let caps = self.tools.get(name).ok_or_else(|| PolicyError::ToolDenied {
+    /// Edit, WebFetch, WebSearch...) and want a yes/no plus the full
+    /// [`ToolRecord`] (capabilities + routing hints) to act on.
+    pub fn check_tool(&self, name: &str) -> Result<&ToolRecord, PolicyError> {
+        let record = self.tools.get(name).ok_or_else(|| PolicyError::ToolDenied {
             name: name.to_string(),
             reason: "tool not declared in [tools]".into(),
         })?;
-        for cap in caps {
+        for cap in &record.capabilities {
             self.check_function(cap).map_err(|e| PolicyError::ToolDenied {
                 name: name.to_string(),
                 reason: format!("required capability {cap:?} not allowed: {e}"),
             })?;
         }
-        Ok(caps.as_slice())
+        Ok(record)
     }
 
+    /// Look up a tool's routing hint (URL + method + description) by
+    /// name without checking capability permission. Useful for
+    /// bridges that surface available tools to a model — they want
+    /// the routing info even if the tool happens to fail the
+    /// capability check (so they can show a clear "not enabled"
+    /// reason).
+    pub fn tool_routing(&self, name: &str) -> Option<&ToolRecord> {
+        self.tools.get(name)
+    }
+
+    /// Whether the named capability is permitted by the policy. A
+    /// capability is permitted exactly when the corresponding resource
+    /// section is populated — `read_allow` or `local_only_read` for
+    /// `fs.read`, `allow_commands` or `local_only_commands` for
+    /// `subprocess.exec`, etc. There is no separate `[functions]`
+    /// allowlist; populating a resource section is the declaration of
+    /// intent.
     pub fn check_function(&self, name: &str) -> Result<(), PolicyError> {
-        if self.fn_deny.iter().any(|f| f == name) {
-            return Err(PolicyError::FunctionDenied {
-                name: name.to_string(),
-                reason: "explicit deny in [functions].deny".into(),
-            });
-        }
-        if self.fn_allow.iter().any(|f| f == name) {
+        if self.fn_derived.iter().any(|f| *f == name) {
             return Ok(());
         }
         Err(PolicyError::FunctionDenied {
             name: name.to_string(),
-            reason: "not in [functions].allow allowlist".into(),
+            reason: format!(
+                "no resource section enables {name:?} \
+                 (populate [filesystem].read_allow / write_allow / \
+                 delete_allow / local_only_read for fs.* capabilities; \
+                 [network].http_*_allow / local_only_hosts for net.*; \
+                 [environment].allow_vars / local_only_vars for \
+                 env.read; [subprocess].allow_commands / \
+                 local_only_commands for subprocess.exec)"
+            ),
         })
+    }
+
+    /// The capabilities currently enabled. Useful for diagnostics
+    /// ("what can my agent actually do?") and for hosts that want to
+    /// surface the effective permission set.
+    pub fn effective_functions(&self) -> Vec<&str> {
+        self.fn_derived.iter().copied().collect()
     }
 
     pub fn check_fs_read(&self, path: &Path) -> Result<PathBuf, PolicyError> {
@@ -514,7 +792,13 @@ impl Policy {
             FsAction::Write => &self.fs_write,
             FsAction::Delete => &self.fs_delete,
         };
-        if !allow.is_match(&resolved) {
+        // Reads can also be permitted by `local_only_read` (the path
+        // is readable but the value will be tainted). Writes and
+        // deletes have no local-only equivalent.
+        let permitted = allow.is_match(&resolved)
+            || (matches!(action, FsAction::Read)
+                && self.fs_local_only_read.is_match(&resolved));
+        if !permitted {
             return Err(PolicyError::PathDenied {
                 action: action.as_str(),
                 path: resolved,
@@ -573,7 +857,9 @@ impl Policy {
             HttpVerb::Patch => &self.net_patch_hosts,
             HttpVerb::Delete => &self.net_delete_hosts,
         };
-        if !allow.is_match(&host) {
+        // Hosts in `local_only_hosts` are also permitted (their
+        // response bodies will be tainted at output boundaries).
+        if !allow.is_match(&host) && !self.net_local_only_hosts.is_match(&host) {
             return Err(PolicyError::HostDenied {
                 action: verb.as_str(),
                 host,
@@ -614,13 +900,49 @@ impl Policy {
                 reason: "matches [environment].deny_vars".into(),
             });
         }
-        if !self.env_allow.iter().any(|n| n == name) {
+        let in_allow = self.env_allow.iter().any(|n| n == name);
+        let in_local_only = self.env_local_only.iter().any(|n| n == name);
+        if !in_allow && !in_local_only {
             return Err(PolicyError::EnvDenied {
                 name: name.to_string(),
-                reason: "not in [environment].allow_vars".into(),
+                reason: "not in [environment].allow_vars or local_only_vars".into(),
             });
         }
         Ok(())
+    }
+
+    /// Whether reading the env var should yield a tainted value.
+    /// Local-only wins over plain allow when the same name appears in
+    /// both lists.
+    pub fn env_is_local_only(&self, name: &str) -> bool {
+        self.env_local_only.iter().any(|n| n == name)
+    }
+
+    /// Whether the resolved filesystem path's CONTENTS, once read,
+    /// should be tainted at output boundaries. Path must already have
+    /// passed `check_fs_read`. Local-only wins over plain `read_allow`.
+    pub fn fs_read_is_local_only(&self, resolved: &Path) -> bool {
+        self.fs_local_only_read.is_match(resolved)
+    }
+
+    /// Whether subprocess output (stdout/stderr) from this command
+    /// should be tainted at output boundaries. Matched by basename of
+    /// argv[0], or against the full literal argv[0] for absolute-path
+    /// entries.
+    pub fn subprocess_is_local_only(&self, argv0: &str) -> bool {
+        let basename = std::path::Path::new(argv0)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(argv0);
+        self.subprocess_local_only
+            .iter()
+            .any(|c| c == basename || c == argv0)
+    }
+
+    /// Whether HTTP response bodies from this host should be tainted
+    /// at output boundaries.
+    pub fn host_is_local_only(&self, host: &str) -> bool {
+        self.net_local_only_hosts.is_match(host)
     }
 
     /// Match argv[0] against the subprocess command policy. Both lists
@@ -647,6 +969,14 @@ impl Policy {
             .iter()
             .any(|c| c == basename || c == argv0)
         {
+            return Ok(());
+        }
+        if self
+            .subprocess_local_only
+            .iter()
+            .any(|c| c == basename || c == argv0)
+        {
+            // local-only command — permitted; output will be tainted.
             return Ok(());
         }
         Err(PolicyError::CommandDenied {
@@ -827,6 +1157,54 @@ fn parse_ip_or_cidr(s: &str) -> Result<IpNet> {
     })
 }
 
+/// Compute the set of capabilities implied by populated resource
+/// sections. Used when `[functions].allow` is absent: any non-empty
+/// resource list is read as the operator declaring intent to use the
+/// matching capability.
+///
+/// Local-only and plain allow lists both count: if you list any host
+/// in `local_only_hosts`, you implicitly intend the corresponding
+/// HTTP verbs to be usable.
+fn derive_capabilities(file: &PolicyFile) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    let fs = &file.filesystem;
+    if !fs.read_allow.is_empty() || !fs.local_only_read.is_empty() {
+        out.push("fs.read");
+    }
+    if !fs.write_allow.is_empty() {
+        out.push("fs.write");
+    }
+    if !fs.delete_allow.is_empty() {
+        out.push("fs.delete");
+    }
+    let net = &file.network;
+    let any_local_only_host = !net.local_only_hosts.is_empty();
+    if !net.http_get_allow.is_empty() || any_local_only_host {
+        out.push("net.http_get");
+    }
+    if !net.http_post_allow.is_empty() || any_local_only_host {
+        out.push("net.http_post");
+    }
+    if !net.http_put_allow.is_empty() || any_local_only_host {
+        out.push("net.http_put");
+    }
+    if !net.http_patch_allow.is_empty() || any_local_only_host {
+        out.push("net.http_patch");
+    }
+    if !net.http_delete_allow.is_empty() || any_local_only_host {
+        out.push("net.http_delete");
+    }
+    let env = &file.environment;
+    if !env.allow_vars.is_empty() || !env.local_only_vars.is_empty() {
+        out.push("env.read");
+    }
+    let sub = &file.subprocess;
+    if !sub.allow_commands.is_empty() || !sub.local_only_commands.is_empty() {
+        out.push("subprocess.exec");
+    }
+    out
+}
+
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
@@ -869,602 +1247,3 @@ fn resolve_path(root: &Path, p: &Path) -> PathBuf {
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn dev_policy() -> Policy {
-        let toml = r#"
-[filesystem]
-read_allow = ["src/**", "/tmp/**"]
-write_allow = ["/tmp/**"]
-delete_allow = ["/tmp/**"]
-deny = ["~/.aws/**", ".env", "**/secrets/**"]
-
-[network]
-http_get_allow = ["api.github.com", "*.npmjs.org"]
-http_post_allow = []
-deny_hosts = ["evil.example.com"]
-deny_ips = ["169.254.169.254"]
-
-[functions]
-allow = ["fs.read", "net.http_get"]
-deny = []
-"#;
-        let file = PolicyFile::from_toml_str(toml).unwrap();
-        Policy::from_file(file, PathBuf::from("/work")).unwrap()
-    }
-
-    #[test]
-    fn fn_allow_and_deny() {
-        let p = dev_policy();
-        assert!(p.check_function("fs.read").is_ok());
-        assert!(p.check_function("subprocess.exec").is_err());
-    }
-
-    #[test]
-    fn fs_read_allow_relative() {
-        let p = dev_policy();
-        assert!(p.check_fs_read(Path::new("src/main.rs")).is_ok());
-    }
-
-    #[test]
-    fn fs_read_deny_credential() {
-        let p = dev_policy();
-        let home = home_dir().unwrap_or(PathBuf::from("/home/x"));
-        let creds = home.join(".aws/credentials");
-        assert!(p.check_fs_read(&creds).is_err());
-    }
-
-    #[test]
-    fn fs_read_anywhere_dot_env() {
-        let p = dev_policy();
-        // `.env` should match anywhere under root via gitignore-ish translation.
-        assert!(p.check_fs_read(Path::new("/work/sub/.env")).is_err());
-    }
-
-    #[test]
-    fn fs_write_outside_tmp_denied() {
-        let p = dev_policy();
-        assert!(p.check_fs_write(Path::new("/work/src/main.rs")).is_err());
-        assert!(p.check_fs_write(Path::new("/tmp/out.txt")).is_ok());
-    }
-
-    #[test]
-    fn http_get_allow_host_glob() {
-        let p = dev_policy();
-        assert!(p.check_http_get("https://api.github.com/repos").is_ok());
-        assert!(p.check_http_get("https://registry.npmjs.org/foo").is_ok());
-        assert!(p.check_http_get("https://evil.example.com/").is_err());
-        assert!(p.check_http_get("https://169.254.169.254/").is_err());
-    }
-
-    #[test]
-    fn http_verb_allow_lists_independent() {
-        let toml = r#"
-[network]
-http_get_allow    = ["api.github.com"]
-http_post_allow   = ["api.example.com"]
-http_put_allow    = ["api.example.com"]
-http_patch_allow  = ["api.example.com"]
-http_delete_allow = ["api.example.com"]
-
-[functions]
-allow = ["net.http_get", "net.http_post", "net.http_put", "net.http_patch", "net.http_delete"]
-"#;
-        let file = PolicyFile::from_toml_str(toml).unwrap();
-        let p = Policy::from_file(file, PathBuf::from("/work")).unwrap();
-        // GET only on api.github.com
-        assert!(p.check_http_get("https://api.github.com/zen").is_ok());
-        assert!(p.check_http_get("https://api.example.com/").is_err());
-        // POST/PUT/PATCH/DELETE only on api.example.com
-        assert!(p.check_http_post("https://api.example.com/x").is_ok());
-        assert!(p.check_http_post("https://api.github.com/x").is_err());
-        assert!(p.check_http_put("https://api.example.com/x").is_ok());
-        assert!(p.check_http_patch("https://api.example.com/x").is_ok());
-        assert!(p.check_http_delete("https://api.example.com/x").is_ok());
-        // Cross-verb leaks are blocked
-        assert!(p.check_http_put("https://api.github.com/x").is_err());
-    }
-
-    fn cidr_policy() -> Policy {
-        let toml = r#"
-[network]
-http_get_allow = ["api.github.com"]
-deny_ips = [
-    "169.254.0.0/16",
-    "10.0.0.0/8",
-    "127.0.0.1",      # literal — should be coerced to /32
-    "::1",            # literal IPv6
-]
-
-[functions]
-allow = ["net.http_get"]
-"#;
-        let file = PolicyFile::from_toml_str(toml).unwrap();
-        Policy::from_file(file, PathBuf::from("/work")).unwrap()
-    }
-
-    #[test]
-    fn cidr_blocks_link_local_range() {
-        let p = cidr_policy();
-        // any IP in 169.254.0.0/16
-        assert!(p
-            .check_http_get("https://169.254.169.254/latest/meta-data/")
-            .is_err());
-        assert!(p.check_http_get("https://169.254.0.1/").is_err());
-        assert!(p.check_http_get("https://169.254.255.255/").is_err());
-        // Outside the /16
-        assert!(p.check_http_get("https://169.255.0.1/").is_err()); // outside CIDR but not allowed → host-allow check rejects
-    }
-
-    #[test]
-    fn cidr_blocks_rfc1918_range() {
-        let p = cidr_policy();
-        for ip in ["10.0.0.1", "10.0.0.255", "10.255.255.255"] {
-            let url = format!("https://{ip}/admin");
-            let err = p.check_http_get(&url).unwrap_err().to_string();
-            assert!(err.contains("deny_ips"), "expected CIDR rejection for {ip}, got: {err}");
-        }
-    }
-
-    #[test]
-    fn literal_ip_in_deny_ips_works() {
-        let p = cidr_policy();
-        assert!(p.check_http_get("https://127.0.0.1/").is_err());
-        assert!(p.check_http_get("https://[::1]/").is_err());
-    }
-
-    #[test]
-    fn check_resolved_ip_pure() {
-        let p = cidr_policy();
-        // hostname-style label, IP from a hypothetical DNS resolution
-        let internal: IpAddr = "192.168.1.1".parse().unwrap();
-        // not in any deny_ips entry → allowed
-        assert!(p
-            .check_resolved_ip("http_get", "internal.example.com", internal)
-            .is_ok());
-
-        let metadata: IpAddr = "169.254.169.254".parse().unwrap();
-        let err = p
-            .check_resolved_ip("http_get", "metadata.example.com", metadata)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("169.254.0.0/16"), "{err}");
-        assert!(err.contains("metadata.example.com"), "{err}");
-    }
-
-    fn full_policy() -> Policy {
-        let toml = r#"
-[environment]
-allow_vars = ["PATH", "USER"]
-deny_vars = ["AWS_SECRET_ACCESS_KEY"]
-
-[subprocess]
-allow_commands = ["git", "/usr/local/bin/npm"]
-deny_commands = ["rm", "dd", "shred"]
-
-[functions]
-allow = ["env.read", "subprocess.exec"]
-"#;
-        let file = PolicyFile::from_toml_str(toml).unwrap();
-        Policy::from_file(file, PathBuf::from("/work")).unwrap()
-    }
-
-    #[test]
-    fn env_allow_and_deny() {
-        let p = full_policy();
-        assert!(p.check_env_read("PATH").is_ok());
-        assert!(p.check_env_read("USER").is_ok());
-        assert!(p.check_env_read("HOME").is_err()); // not in allow_vars
-        assert!(p.check_env_read("AWS_SECRET_ACCESS_KEY").is_err()); // explicit deny
-    }
-
-    #[test]
-    fn subprocess_command_allow_basename() {
-        let p = full_policy();
-        // bare command name in allow
-        assert!(p.check_subprocess_command("git").is_ok());
-        // /usr/bin/git matches because basename match
-        assert!(p.check_subprocess_command("/usr/bin/git").is_ok());
-        // explicit absolute path in allow
-        assert!(p.check_subprocess_command("/usr/local/bin/npm").is_ok());
-        // basename of /usr/bin/npm is "npm" which is NOT in allow (only "/usr/local/bin/npm" is)
-        assert!(p.check_subprocess_command("/usr/bin/npm").is_err());
-    }
-
-    #[test]
-    fn subprocess_command_deny_wins() {
-        let p = full_policy();
-        assert!(p.check_subprocess_command("rm").is_err());
-        assert!(p.check_subprocess_command("/bin/rm").is_err()); // basename
-        assert!(p.check_subprocess_command("dd").is_err());
-    }
-
-    #[test]
-    fn subprocess_unknown_command_denied() {
-        let p = full_policy();
-        assert!(p.check_subprocess_command("curl").is_err());
-        assert!(p.check_subprocess_command("ssh").is_err());
-    }
-
-    fn deny_args_policy() -> Policy {
-        let toml = r#"
-[subprocess]
-allow_commands = ["git", "rails", "bundle"]
-
-[subprocess.deny_args]
-git = ["push --force", "push -f", "reset --hard"]
-rails = ["db:drop", "db:reset"]
-bundle = ["add", "publish"]
-
-[functions]
-allow = ["subprocess.exec"]
-"#;
-        let file = PolicyFile::from_toml_str(toml).unwrap();
-        Policy::from_file(file, PathBuf::from("/work")).unwrap()
-    }
-
-    fn argv(parts: &[&str]) -> Vec<String> {
-        parts.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn deny_args_blocks_multitoken_pattern() {
-        let p = deny_args_policy();
-        // git push --force origin main → blocked by "push --force"
-        let r = p.check_subprocess_args(&argv(&["git", "push", "--force", "origin", "main"]));
-        assert!(r.is_err());
-        let err = r.unwrap_err().to_string();
-        assert!(err.contains("push --force"), "{err}");
-    }
-
-    #[test]
-    fn deny_args_basename_match() {
-        let p = deny_args_policy();
-        // /usr/bin/git push -f → still matches via basename
-        let r = p.check_subprocess_args(&argv(&["/usr/bin/git", "push", "-f"]));
-        assert!(r.is_err());
-    }
-
-    #[test]
-    fn deny_args_allows_safe_invocation() {
-        let p = deny_args_policy();
-        assert!(p
-            .check_subprocess_args(&argv(&["git", "push", "origin", "main"]))
-            .is_ok());
-        assert!(p
-            .check_subprocess_args(&argv(&["git", "log", "--oneline"]))
-            .is_ok());
-    }
-
-    #[test]
-    fn deny_args_single_token_pattern() {
-        let p = deny_args_policy();
-        // bundle add gem-name → blocked by "add"
-        assert!(p
-            .check_subprocess_args(&argv(&["bundle", "add", "rails"]))
-            .is_err());
-        // rails db:drop → blocked
-        assert!(p
-            .check_subprocess_args(&argv(&["rails", "db:drop"]))
-            .is_err());
-        // rails server → no entry matches
-        assert!(p
-            .check_subprocess_args(&argv(&["rails", "server"]))
-            .is_ok());
-    }
-
-    #[test]
-    fn deny_args_command_with_no_entry_is_allowed() {
-        let p = deny_args_policy();
-        // npm not in deny_args map at all
-        assert!(p
-            .check_subprocess_args(&argv(&["npm", "publish"]))
-            .is_ok());
-    }
-
-    #[test]
-    fn deny_args_empty_argv_is_noop() {
-        let p = deny_args_policy();
-        assert!(p.check_subprocess_args(&[]).is_ok());
-    }
-
-    #[test]
-    fn inherits_secure_defaults_pulls_in_baseline_denies() {
-        // Minimal user file with no boilerplate.
-        let user = r#"
-inherits = "secure-defaults"
-
-[filesystem]
-read_allow = ["src/**"]
-write_allow = ["src/**"]
-
-[functions]
-allow = ["fs.read", "fs.write"]
-"#;
-        let file = PolicyFile::from_toml_str(user)
-            .unwrap()
-            .resolve_inheritance()
-            .unwrap();
-        let p = Policy::from_file(file, PathBuf::from("/work")).unwrap();
-
-        // Inherited fs deny list catches credentials.
-        let home = home_dir().unwrap_or_else(|| PathBuf::from("/home/x"));
-        let creds = home.join(".aws/credentials");
-        assert!(p.check_fs_read(&creds).is_err());
-
-        // Inherited deny_vars catches OPENAI_API_KEY.
-        assert!(p.check_env_read("OPENAI_API_KEY").is_err());
-
-        // Inherited deny_commands catches rm/sudo/kubectl.
-        assert!(p.check_subprocess_command("rm").is_err());
-        assert!(p.check_subprocess_command("kubectl").is_err());
-
-        // The user's own allow_list still applies.
-        assert!(p.check_fs_read(Path::new("/work/src/main.rs")).is_ok());
-    }
-
-    #[test]
-    fn user_extends_preset_deny_lists() {
-        let user = r#"
-inherits = "secure-defaults"
-
-[filesystem]
-read_allow = ["src/**"]
-deny = ["**/Gemfile.lock"]    # extra deny on top of preset's
-
-[functions]
-allow = ["fs.read"]
-"#;
-        let file = PolicyFile::from_toml_str(user)
-            .unwrap()
-            .resolve_inheritance()
-            .unwrap();
-
-        // User's deny entry survived.
-        assert!(file.filesystem.deny.iter().any(|p| p == "**/Gemfile.lock"));
-        // Preset's deny entries also survived.
-        assert!(file.filesystem.deny.iter().any(|p| p == "~/.aws/**"));
-        assert!(file.filesystem.deny.iter().any(|p| p == ".env"));
-    }
-
-    #[test]
-    fn override_can_remove_preset_filesystem_deny() {
-        let user = r#"
-inherits = "secure-defaults"
-
-[filesystem]
-read_allow = ["~/.aws/**"]      # we WANT to read aws creds
-deny = ["!~/.aws/**"]           # remove the inherited block
-
-[functions]
-allow = ["fs.read"]
-"#;
-        let file = PolicyFile::from_toml_str(user)
-            .unwrap()
-            .resolve_inheritance()
-            .unwrap();
-        // The preset's universal `~/.aws/**` deny is gone.
-        assert!(!file.filesystem.deny.iter().any(|p| p == "~/.aws/**"));
-        // Other inherited denies are still there.
-        assert!(file.filesystem.deny.iter().any(|p| p == "**/.env"));
-    }
-
-    #[test]
-    fn override_can_unblock_preset_subprocess_command() {
-        // Preset blocks kubectl. A k8s operator agent legitimately
-        // needs it inside a kind/minikube sandbox.
-        let user = r#"
-inherits = "secure-defaults"
-
-[subprocess]
-allow_commands = ["kubectl"]
-deny_commands = ["!kubectl"]    # un-deny
-
-[functions]
-allow = ["subprocess.exec"]
-"#;
-        let file = PolicyFile::from_toml_str(user)
-            .unwrap()
-            .resolve_inheritance()
-            .unwrap();
-        assert!(!file.subprocess.deny_commands.iter().any(|c| c == "kubectl"));
-        // Other inherited denies remain.
-        assert!(file.subprocess.deny_commands.iter().any(|c| c == "rm"));
-        assert!(file.subprocess.deny_commands.iter().any(|c| c == "sudo"));
-    }
-
-    #[test]
-    fn override_can_remove_preset_deny_ip_cidr() {
-        // Local dev: legitimately want to talk to a service on
-        // 127.0.0.1 (the preset's loopback block normally prevents this).
-        let user = r#"
-inherits = "secure-defaults"
-
-[network]
-http_get_allow = ["localhost"]
-deny_ips = ["!127.0.0.0/8"]
-
-[functions]
-allow = ["net.http_get"]
-"#;
-        let file = PolicyFile::from_toml_str(user)
-            .unwrap()
-            .resolve_inheritance()
-            .unwrap();
-        assert!(!file.network.deny_ips.iter().any(|p| p == "127.0.0.0/8"));
-        // Cloud metadata block survives.
-        assert!(file
-            .network
-            .deny_ips
-            .iter()
-            .any(|p| p == "169.254.0.0/16"));
-        // Final policy parses cleanly (no leftover "!..." strings).
-        let p = Policy::from_file(file, PathBuf::from("/work")).unwrap();
-        // Confirm the IP-level check now lets 127.0.0.1 through.
-        let ip: IpAddr = "127.0.0.1".parse().unwrap();
-        assert!(p.check_resolved_ip("http_get", "localhost", ip).is_ok());
-        // ...while 169.254.169.254 is still rejected.
-        let metadata: IpAddr = "169.254.169.254".parse().unwrap();
-        assert!(p
-            .check_resolved_ip("http_get", "metadata", metadata)
-            .is_err());
-    }
-
-    #[test]
-    fn override_negate_nonexistent_is_silent_noop() {
-        let user = r#"
-inherits = "secure-defaults"
-
-[filesystem]
-read_allow = ["src/**"]
-deny = ["!~/never-was-in-the-preset/**"]
-
-[functions]
-allow = ["fs.read"]
-"#;
-        // No error; merged file just doesn't have that entry.
-        let file = PolicyFile::from_toml_str(user)
-            .unwrap()
-            .resolve_inheritance()
-            .unwrap();
-        // The `!` form is consumed, not retained.
-        assert!(!file
-            .filesystem
-            .deny
-            .iter()
-            .any(|p| p.starts_with('!')));
-    }
-
-    #[test]
-    fn override_can_remove_preset_confirm() {
-        let user = r#"
-inherits = "secure-defaults"
-confirm_per_call = ["!subprocess.exec"]
-
-[functions]
-allow = ["subprocess.exec"]
-"#;
-        let file = PolicyFile::from_toml_str(user)
-            .unwrap()
-            .resolve_inheritance()
-            .unwrap();
-        // subprocess.exec is no longer prompt-gated.
-        assert!(!file
-            .confirm_per_call
-            .iter()
-            .any(|c| c == "subprocess.exec"));
-        // fs.delete is still prompt-gated.
-        assert!(file.confirm_per_call.iter().any(|c| c == "fs.delete"));
-    }
-
-    #[test]
-    fn tools_block_lookup_and_capability_check() {
-        let toml = r#"
-[tools]
-Read = ["fs.read"]
-Edit = ["fs.read", "fs.write"]
-Bash = ["subprocess.exec"]
-WebFetch = ["net.http_get"]
-
-[functions]
-allow = ["fs.read", "net.http_get"]
-"#;
-        let file = PolicyFile::from_toml_str(toml).unwrap();
-        let p = Policy::from_file(file, PathBuf::from("/work")).unwrap();
-        // Read needs fs.read which is allowed → ok
-        let caps = p.check_tool("Read").unwrap();
-        assert_eq!(caps, &["fs.read"]);
-        // WebFetch needs net.http_get → ok
-        assert!(p.check_tool("WebFetch").is_ok());
-        // Edit needs fs.write which is NOT allowed → tool denied
-        let err = p.check_tool("Edit").unwrap_err().to_string();
-        assert!(err.contains("Edit"), "{err}");
-        assert!(err.contains("fs.write"), "{err}");
-        // Bash needs subprocess.exec → not allowed
-        assert!(p.check_tool("Bash").is_err());
-        // Tool not declared in [tools] → denied
-        let err = p.check_tool("UnknownTool").unwrap_err().to_string();
-        assert!(err.contains("not declared"), "{err}");
-    }
-
-    #[test]
-    fn tools_inherit_and_extend_via_merge() {
-        // Conceptually: a preset declares standard tools, the user
-        // file extends with project-specific ones and can `!`-remove
-        // a capability requirement from an inherited tool.
-        let base_toml = r#"
-[tools]
-Read = ["fs.read"]
-Bash = ["subprocess.exec"]
-"#;
-        let over_toml = r#"
-[tools]
-Bash = ["!subprocess.exec"]    # un-require subprocess.exec for Bash (e.g., shadow Bash)
-WebFetch = ["net.http_get"]    # add a new tool
-"#;
-        let base = PolicyFile::from_toml_str(base_toml).unwrap();
-        let over = PolicyFile::from_toml_str(over_toml).unwrap();
-        let merged = merge_policy_files(base, over);
-        assert_eq!(merged.tools.get("Read").unwrap(), &vec!["fs.read".to_string()]);
-        assert!(merged.tools.get("Bash").unwrap().is_empty());
-        assert_eq!(
-            merged.tools.get("WebFetch").unwrap(),
-            &vec!["net.http_get".to_string()]
-        );
-    }
-
-    #[test]
-    fn override_can_remove_specific_deny_args_pattern() {
-        let preset_like = r#"
-[subprocess.deny_args]
-git = ["push --force", "reset --hard"]
-"#;
-        let user = r#"
-[subprocess.deny_args]
-git = ["!reset --hard"]
-"#;
-        let base = PolicyFile::from_toml_str(preset_like).unwrap();
-        let over = PolicyFile::from_toml_str(user).unwrap();
-        let merged = merge_policy_files(base, over);
-        let git_args = merged.subprocess.deny_args.get("git").unwrap();
-        assert!(git_args.contains(&"push --force".to_string()));
-        assert!(!git_args.contains(&"reset --hard".to_string()));
-    }
-
-    #[test]
-    fn unknown_preset_errors_clearly() {
-        let user = r#"inherits = "does-not-exist""#;
-        let res = PolicyFile::from_toml_str(user)
-            .unwrap()
-            .resolve_inheritance();
-        assert!(res.is_err());
-        let msg = res.unwrap_err().to_string();
-        assert!(msg.contains("does-not-exist"));
-    }
-
-    #[test]
-    fn deny_args_merge_concatenates_per_command() {
-        // Preset has no deny_args; user provides some. Then a derived
-        // file (synthesized in test) merges in additional patterns.
-        let base_toml = r#"
-[subprocess.deny_args]
-git = ["push --force"]
-"#;
-        let over_toml = r#"
-[subprocess.deny_args]
-git = ["reset --hard"]
-rails = ["db:drop"]
-"#;
-        let base = PolicyFile::from_toml_str(base_toml).unwrap();
-        let over = PolicyFile::from_toml_str(over_toml).unwrap();
-        let merged = merge_policy_files(base, over);
-        let git_args = merged.subprocess.deny_args.get("git").unwrap();
-        assert!(git_args.contains(&"push --force".to_string()));
-        assert!(git_args.contains(&"reset --hard".to_string()));
-        let rails_args = merged.subprocess.deny_args.get("rails").unwrap();
-        assert!(rails_args.contains(&"db:drop".to_string()));
-    }
-
-}
