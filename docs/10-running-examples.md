@@ -10,6 +10,54 @@ results in [docs/09-local-executor.md](09-local-executor.md) are
 reproducible on any Linux/macOS machine with the prerequisites
 installed.
 
+## Results at a glance
+
+The four headline measurements the project's docs cite, in one
+place:
+
+| Harness                 | Configuration                                              | Result        | Cost       | What it measures |
+|-------------------------|------------------------------------------------------------|---------------|------------|------------------|
+| `run.py`                | qwen2.5-coder:7b alone, 10 single-step tasks               | **10/10**     | $0         | Smoke test — your install is wired correctly, every capability gate fires once. |
+| `run_multistep.py`      | qwen2.5-coder:7b alone + RAG + 1-retry, 36 multi-step      | **36/36**     | $0         | The headline number. Local 7B + Aegis with no cloud orchestrator passes the full suite, including 5 feature-demo tasks pinning recent security fixes. |
+| `run_orchestrated.py`   | Sonnet → qwen+Aegis, 36-task suite                         | **30/36**     | **$1.37**  | Cloud orchestrator on top of the same stack; 6 misses are model-side artifacts (refusal pattern + paraphrase). |
+| `run_orchestrated.py`   | Opus → qwen+Aegis, 36-task suite                           | **28/36**     | **$4.09**  | Same shape; 8 misses split between paraphrase, refusal, and a GitHub API rate-limit hit during the longer run. |
+
+### How to read these
+
+- **`qwen alone: 36/36` is the runtime measurement.** No Anthropic
+  API call, no `claude` binary, no cloud orchestrator. A stock 7B
+  model writes Starlark, Aegis enforces the policy, the verify
+  hooks check both printed output AND filesystem state. This is
+  what the project is fundamentally claiming: a local 7B + an
+  addition-based Starlark runtime is enough to pass a 36-task
+  composition suite with full policy enforcement.
+
+- **The orchestrated rows are *not* worse runtime numbers.** The
+  runtime denies and redacts correctly in every orchestrated
+  task where it's invoked. The orchestrated misses fall into
+  three buckets, all model-side:
+
+  | Bucket | Why it fails the verify hook | Counts as a runtime bug? |
+  |--------|------------------------------|--------------------------|
+  | Sonnet preemptive refusal on DENY tasks | The orchestrator recognises a task as "obviously unsafe" (`/etc/passwd`, `AWS_SECRET_ACCESS_KEY`, IMDS SSRF) and refuses to delegate any step. Aegis would have correctly denied if it had been called. | No — the refusal is at a *higher* layer than the gate, not a bypass. |
+  | Verify-hook substring strictness on LOCAL_ONLY tasks | Aegis correctly substitutes `[REDACTED]` in the redacted output; the orchestrator then paraphrases qwen's literal output ("the secret was redacted") instead of preserving the sentinel verbatim, and the verify hook does a substring match. | No — the redaction worked; the test is over-strict on output format. |
+  | `api.github.com` 60-req/hour rate-limit | Opus uses more turns/task; the back half of its run hits 403s when the unauthenticated GitHub quota runs out. | No — direct `aegis run` against the same URLs succeeds. |
+
+- **What this implies for "how good is Aegis."** The runtime layer
+  is at parity with itself across single-step, multi-step, and
+  orchestrated configurations: the *same* policy enforces the
+  *same* gates and produces the *same* denials. Where the
+  orchestrated numbers dip below 36/36 is a measurement of the
+  orchestrator's behavior, not Aegis's.
+
+- **What this implies for cost.** The orchestrated mode buys you
+  task decomposition and step routing for ~$0.04/task (Sonnet) to
+  ~$0.11/task (Opus). The local-only mode is free per task at the
+  cost of a one-time `ollama pull` (~5 GB).
+
+The full per-failure breakdown for the orchestrated run lives in
+[docs/09-local-executor.md](09-local-executor.md#phase-2-orchestrated-run_orchestratedpy--sonnetopus--qwen).
+
 ## Prerequisites
 
 | Component | Why | Install |
@@ -194,7 +242,7 @@ Reading right to left:
 - `mcp=OK` means Aegis returned without error (or `ERR` if it did).
 - `✓` / `✗` is whether the verify hook accepted the result.
 
-A run ends with a summary like `26/31 passed` plus a per-category
+A run ends with a summary like `36/36 passed` plus a per-category
 breakdown. Failures print extra context: the generated Starlark
 program (with `--show-script`) and the Aegis error message.
 
@@ -226,7 +274,7 @@ Verify-hook helpers in `run_multistep.py`:
   shape used by DENY tasks (earlier steps persisted, blocked step
   did not)
 
-Once added, the new task runs alongside the existing 31 in the
+Once added, the new task runs alongside the existing 36 in the
 default run.
 
 ## Reproducing the README numbers
