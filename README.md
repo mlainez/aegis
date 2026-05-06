@@ -1,5 +1,17 @@
 # Aegis
 
+> ## ⚠ Project status: archived / moved
+>
+> **Development has moved to [`Spin42/denyx`](https://github.com/Spin42/denyx).**
+>
+> This repository is kept for **historical archiving** and will not receive
+> regular feature work going forward. What started as a personal side project is
+> now continuing as part of the author’s company work.
+>
+> If you’re evaluating or adopting this project, please use
+> **[`Spin42/denyx`](https://github.com/Spin42/denyx)** for the actively
+> maintained codebase.
+
 **A safe-by-design local tooling layer for agentic AI, with deliberate
 control over permissions through a policy file.**
 
